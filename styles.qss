@@ -1,0 +1,182 @@
+/* Main Application Styling */
+QWidget {
+    background-color: #2d2d2d;
+    color: #ffffff;
+    font-family: "Segoe UI";
+    font-size: 9pt;
+    selection-background-color: #3daee9;
+    selection-color: #ffffff;
+}
+
+/* Menu Bar */
+QMenuBar {
+    background-color: #3d3d3d;
+    border-bottom: 1px solid #252525;
+}
+
+QMenuBar::item {
+    padding: 4px 8px;
+    background-color: transparent;
+}
+
+QMenuBar::item:selected {
+    background-color: #505050;
+}
+
+/* Buttons */
+QPushButton {
+    background-color: #404040;
+    border: 1px solid #555555;
+    border-radius: 3px;
+    padding: 5px;
+    min-width: 60px;
+}
+
+QPushButton:hover {
+    background-color: #505050;
+}
+
+QPushButton:pressed {
+    background-color: #606060;
+}
+
+/* Line Edits */
+QLineEdit {
+    background-color: #353535;
+    border: 1px solid #454545;
+    border-radius: 3px;
+    padding: 3px;
+    selection-background-color: #3daee9;
+}
+
+/* Scroll Bars */
+QScrollBar:vertical {
+    background: #353535;
+    width: 10px;
+    margin: 0px 0px 0px 0px;
+}
+
+QScrollBar::handle:vertical {
+    background: #505050;
+    min-height: 20px;
+    border-radius: 4px;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    background: none;
+}
+
+/* Dock Widgets */
+QDockWidget {
+    background: #353535;
+    titlebar-close-icon: url(:/icons/close.png);
+    titlebar-normal-icon: url(:/icons/detach.png);
+}
+
+QDockWidget::title {
+    background: #404040;
+    padding: 4px;
+    text-align: left;
+}
+
+/* Style for all tool buttons */
+QToolButton {
+    padding: 8px 12px;
+    margin: 2px;
+    border: 1px solid #505050;
+    border-radius: 4px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #646464, stop:1 #404040);
+    color: white;
+    min-width: 120px;
+    font: 14px "Segoe UI";
+}
+
+/* Hover effect */
+QToolButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #747474, stop:1 #505050);
+}
+
+/* Pressed effect */
+QToolButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #404040, stop:1 #303030);
+}
+
+/* Icon size */
+QToolButton::icon {
+    width: 32px;
+    height: 32px;
+}
+
+QToolBar::separator {
+    width: 12px;
+    background: transparent;
+}
+
+/* Tab Widget styling */
+QTabWidget::pane {
+    border: 1px solid #404040;
+    background: #353535;
+}
+
+QTabBar::tab {
+    background: #505050;
+    color: white;
+    padding: 8px 12px;
+    border: 1px solid #404040;
+    border-bottom: none;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+}
+
+QTabBar::tab:selected {
+    background: #606060;
+    border-color: #404040;
+}
+
+QTabBar::tab:hover {
+    background: #585858;
+}
+
+
+QSlider::groove:horizontal {
+    border: 1px solid #505050;
+    height: 4px;
+    background: #404040;
+    margin: 2px 0;
+}
+
+QSlider::handle:horizontal {
+    background: #606060;
+    border: 1px solid #505050;
+    width: 12px;
+    margin: -4px 0;
+    border-radius: 2px;
+}
+
+QSlider::sub-page:horizontal {
+    background: #707070;
+}
+
+
+QPushButton {
+    padding: 4px 8px;
+    border: 1px solid #505050;
+    border-radius: 3px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #606060, stop:1 #404040);
+    color: white;
+}
+
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #707070, stop:1 #505050);
+}
+
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #404040, stop:1 #303030);
+}

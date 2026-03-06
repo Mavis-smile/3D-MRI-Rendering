@@ -1,0 +1,20 @@
+<RCC>
+    <qresource prefix="/styles">
+        <file>styles.qss</file>
+    </qresource>
+    <qresource prefix="/icons">
+        <file>icons/close.png</file>
+        <file>icons/detach.png</file>
+        <file>icons/open.png</file>
+        <file>icons/process.png</file>
+        <file>icons/save.png</file>
+        <file>icons/cube.png</file>
+        <file>icons/reset.png</file>
+        <file>icons/up-loading.png</file>
+        <file>icons/material.png</file>
+    </qresource>
+    <qresource prefix="/shaders">
+        <file>shader.frag</file>
+        <file>shader.vert</file>
+    </qresource>
+</RCC>
