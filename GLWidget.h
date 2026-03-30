@@ -9,6 +9,7 @@
 #include <QMatrix4x4>
 #include <QMouseEvent>
 #include <QWheelEvent>
+#include <QFutureWatcher>
 
 inline bool operator<(const QVector3D& a, const QVector3D& b) {
     if (a.x() != b.x()) return a.x() < b.x();
@@ -79,10 +80,16 @@ private:
     float yRot = 0.0f;
 
     size_t indexCount = 0;
+    QFutureWatcher<void> meshExportWatcher;
+    QVector<unsigned int> queuedExportIndices;
+    QVector<QVector3D> queuedExportVertices;
+    bool exportQueued = false;
 
     void createTestCube();
     void createTestTriangle();
-    void exportMeshToFiles(const QVector<unsigned int>& indices, const QVector<QVector3D>& vertices);
+    void queueMeshExport(const QVector<unsigned int>& indices, const QVector<QVector3D>& vertices);
+    void startQueuedMeshExport();
+    static void exportMeshToFiles(const QVector<unsigned int>& indices, const QVector<QVector3D>& vertices);
 
 };
 

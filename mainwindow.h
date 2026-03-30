@@ -33,6 +33,7 @@
 #include <QProgressDialog>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
+#include <functional>
 
 
 class GLWidget;
@@ -64,6 +65,7 @@ protected:
 
 
 private:
+    using ProgressCallback = std::function<void(int, const QString&)>;
     void saveProcessedImage(const QImage& image, const QString& filePath);
     void createMenu();
     void createToolbar();
@@ -75,8 +77,8 @@ private:
     QSlider* thresholdSlider;
     QLabel* thresholdLabel;
     QPushButton* thresholdApplyButton;
-    double pendingThreshold = 0.35;  // Renamed from currentThreshold
-    double currentThreshold = 0.35; // Default threshold
+    double pendingThreshold = 0.43;
+    double currentThreshold = 0.43;
     QTabWidget* mainTabs;
     QWidget* previewTab;
     QScrollArea* previewScroll;
@@ -86,11 +88,13 @@ private:
     void loadImages(const QStringList& filePaths);
     // QImage loadImage(const QString& path);  // Add this line
     // void handleLoadedImages(const QVector<QImage>& images);
+    QImage preprocessLoadedImage(const QImage& input, const QString& path, double thresholdOverride = -1.0, int totalSlicesOverride = -1);
     QImage loadMemoryMappedImage(const QString& path); // Add this line
     // Add this typedef
     using VolumeData = QVector<QVector<QVector<float>>>;
     // Declare the function
-    VolumeData convertToVolume(const QVector<QImage>& images);
+    VolumeData convertToVolume(const QVector<QImage>& images, const ProgressCallback& progressCallback = ProgressCallback());
+    void updateLoadingDialog(int progress, const QString& message);
     void generateMesh();
     VolumeData currentVolume;
     MarchingCubes::Mesh currentMesh;
@@ -111,6 +115,12 @@ private:
     QFutureWatcher<void> meshGenerationWatcher;
     bool isGeneratingMesh = false;
     MarchingCubes::Mesh pendingMesh; // Store mesh while waiting for OpenGL
+
+    // Default physical voxel spacing used for geometry scaling.
+    // Tune to your scanner metadata when available.
+    float voxelSpacingX = 0.30f;
+    float voxelSpacingY = 0.30f;
+    float voxelSpacingZ = 0.50f;
 
 
 };

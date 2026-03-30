@@ -2,6 +2,7 @@
 #include <QFile>
 #include <QDebug>
 #include <QTextStream>
+#include <QtConcurrent/QtConcurrent>
 
 
 GLWidget::GLWidget(QWidget *parent)
@@ -12,9 +13,13 @@ GLWidget::GLWidget(QWidget *parent)
     setMouseTracking(true);
     zoom = 1.0f;
     cameraPosition = QVector3D(0, 0, 0);
+
+    connect(&meshExportWatcher, &QFutureWatcher<void>::finished,
+            this, &GLWidget::startQueuedMeshExport);
 }
 
 GLWidget::~GLWidget() {
+    meshExportWatcher.waitForFinished();
     makeCurrent();
     glDeleteProgram(shaderProgram); // Proper OpenGL cleanup
     vao.destroy();
@@ -136,6 +141,10 @@ void GLWidget::createGeometry() {
 void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsigned int>& indices) {
     qDebug() << "Updating mesh with" << vertices.size() << "vertices and" << indices.size() << "indices";
 
+    if (!isValid()) {
+        qWarning() << "GLWidget context is not valid yet; mesh upload may be deferred until widget is shown.";
+    }
+
     // Debug: Print first 10 vertices
     for (int i = 0; i < qMin(10, vertices.size()); ++i) {
         qDebug() << "Vertex" << i << ":" << vertices[i];
@@ -154,20 +163,66 @@ void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsi
 
     vao.bind();
 
+    QVector<QVector3D> normals(vertices.size(), QVector3D(0.0f, 0.0f, 0.0f));
+    for (int i = 0; i + 2 < indices.size(); i += 3) {
+        const unsigned int ia = indices[i];
+        const unsigned int ib = indices[i + 1];
+        const unsigned int ic = indices[i + 2];
+        if (ia >= static_cast<unsigned int>(vertices.size()) ||
+            ib >= static_cast<unsigned int>(vertices.size()) ||
+            ic >= static_cast<unsigned int>(vertices.size())) {
+            continue;
+        }
+
+        const QVector3D& v0 = vertices[ia];
+        const QVector3D& v1 = vertices[ib];
+        const QVector3D& v2 = vertices[ic];
+        QVector3D faceNormal = QVector3D::crossProduct(v1 - v0, v2 - v0);
+        if (faceNormal.lengthSquared() <= 1e-12f) {
+            continue;
+        }
+
+        normals[ia] += faceNormal;
+        normals[ib] += faceNormal;
+        normals[ic] += faceNormal;
+    }
+
+    QVector<float> interleaved;
+    interleaved.reserve(vertices.size() * 6);
+    for (int i = 0; i < vertices.size(); ++i) {
+        QVector3D n = normals[i];
+        if (n.lengthSquared() <= 1e-12f) {
+            n = QVector3D(0.0f, 0.0f, 1.0f);
+        } else {
+            n.normalize();
+        }
+
+        interleaved.append(vertices[i].x());
+        interleaved.append(vertices[i].y());
+        interleaved.append(vertices[i].z());
+        interleaved.append(n.x());
+        interleaved.append(n.y());
+        interleaved.append(n.z());
+    }
+
     // Upload vertex data
     vbo.create();
     vbo.bind();
-    vbo.allocate(vertices.constData(), vertices.size() * sizeof(QVector3D));
+    vbo.allocate(interleaved.constData(), static_cast<int>(interleaved.size() * sizeof(float)));
     qDebug() << "Vertex buffer size:" << vbo.size() << "bytes";
 
-    // Set up vertex attribute pointer
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(QVector3D), (void*)0);
+    const GLsizei stride = static_cast<GLsizei>(6 * sizeof(float));
+    // Position attribute
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(0);
+    // Normal attribute
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
 
     // Upload index data
     ibo.create();
     ibo.bind();
-    ibo.allocate(indices.constData(), indices.size() * sizeof(unsigned int));
+    ibo.allocate(indices.constData(), static_cast<int>(indices.size() * sizeof(unsigned int)));
     qDebug() << "Index buffer size:" << ibo.size() << "bytes";
 
     indexCount = indices.size();
@@ -192,8 +247,8 @@ void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsi
         qCritical() << "OpenGL Error during buffer upload:" << err;
     }
 
-    // Export mesh data to files
-    exportMeshToFiles(indices, vertices);
+    // Always export mesh, but do file I/O in a background thread.
+    queueMeshExport(indices, vertices);
 
     doneCurrent();
     update();
@@ -236,7 +291,7 @@ void GLWidget::paintGL() {
 
     // Bind VAO and draw
     vao.bind();
-    glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, 0);
+    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(indexCount), GL_UNSIGNED_INT, 0);
 
     // Check for OpenGL errors
     GLenum err;
@@ -246,6 +301,8 @@ void GLWidget::paintGL() {
 }
 
 void GLWidget::resizeGL(int w, int h) {
+    Q_UNUSED(w);
+    Q_UNUSED(h);
     // Handled in paintGL
 }
 
@@ -348,6 +405,29 @@ void GLWidget::createTestTriangle() {
 
 void GLWidget::mouseDoubleClickEvent(QMouseEvent*) {
     resetView();
+}
+
+void GLWidget::queueMeshExport(const QVector<unsigned int>& indices, const QVector<QVector3D>& vertices) {
+    queuedExportIndices = indices;
+    queuedExportVertices = vertices;
+    exportQueued = true;
+    startQueuedMeshExport();
+}
+
+void GLWidget::startQueuedMeshExport() {
+    if (meshExportWatcher.isRunning() || !exportQueued) {
+        return;
+    }
+
+    QVector<unsigned int> indicesToWrite = std::move(queuedExportIndices);
+    QVector<QVector3D> verticesToWrite = std::move(queuedExportVertices);
+    exportQueued = false;
+
+    meshExportWatcher.setFuture(QtConcurrent::run(
+        [indices = std::move(indicesToWrite), vertices = std::move(verticesToWrite)]() mutable {
+            GLWidget::exportMeshToFiles(indices, vertices);
+        }
+    ));
 }
 
 

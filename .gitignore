@@ -1,0 +1,51 @@
+# Qt Creator generated files
+*.pro.user
+*.pro.user.*
+.qmake.stash
+*.autosave
+.qtc_clangd/
+
+# Build directories
+debug/
+release/
+build*/
+out/
+
+# Generated UI headers
+ui_*.h
+
+# Makefiles
+Makefile
+Makefile.*
+
+# Object files
+*.o
+*.obj
+*.slo
+*.lo
+
+# Compiled Dynamic libraries
+*.so
+*.dll
+*.dylib
+
+# Compiled Static libraries
+*.lib
+*.a
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Qt MOC files
+moc_*.cpp
+moc_*.h
+
+# Qt RCC files
+qrc_*.cpp
+
+# Backup files
+*~
+*.bak
+*_backup.pro
