@@ -34,7 +34,6 @@ QVector<QVector<QVector3D>> ImageLoader::loadVolume(const QStringList& filePaths
 
     return volumeData;
 }
-
 QImage ImageLoader::preprocessSlice(const QImage& slice) {
     // Convert to grayscale
     QImage gray = slice.convertToFormat(QImage::Format_Grayscale8);

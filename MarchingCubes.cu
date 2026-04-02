@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <unordered_map>
+#include <cstdint>
 
 namespace {
     bool checkCuda(cudaError_t err, const char* operation)
@@ -22,6 +24,93 @@ namespace {
             }
             return false;
         }
+}
+
+namespace {
+struct QuantizedVertexKey {
+    int x;
+    int y;
+    int z;
+
+    bool operator==(const QuantizedVertexKey& other) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct QuantizedVertexKeyHash {
+    std::size_t operator()(const QuantizedVertexKey& key) const {
+        std::size_t h1 = std::hash<int>{}(key.x);
+        std::size_t h2 = std::hash<int>{}(key.y);
+        std::size_t h3 = std::hash<int>{}(key.z);
+        return h1 ^ (h2 << 1) ^ (h3 << 2);
+    }
+};
+
+QuantizedVertexKey quantizeVertex(const QVector3D& v, float epsilon) {
+    const float safeEps = qMax(1e-6f, epsilon);
+    const float inv = 1.0f / safeEps;
+    return {
+        static_cast<int>(std::lround(v.x() * inv)),
+        static_cast<int>(std::lround(v.y() * inv)),
+        static_cast<int>(std::lround(v.z() * inv))
+    };
+}
+
+int chooseAdaptiveSlabDepth(int requestedSlabDepth, int depth) {
+    size_t freeMem = 0;
+    size_t totalMem = 0;
+    int adaptive = qMax(2, requestedSlabDepth);
+
+    const cudaError_t memInfoStatus = cudaMemGetInfo(&freeMem, &totalMem);
+    if (memInfoStatus == cudaSuccess) {
+        const double freeMB = static_cast<double>(freeMem) / (1024.0 * 1024.0);
+        if (freeMB >= 10000.0) {
+            adaptive = qMax(adaptive, 24);
+        } else if (freeMB >= 7000.0) {
+            adaptive = qMax(adaptive, 20);
+        } else if (freeMB >= 5000.0) {
+            adaptive = qMax(adaptive, 16);
+        } else if (freeMB >= 3000.0) {
+            adaptive = qMax(adaptive, 12);
+        } else {
+            adaptive = qMin(adaptive, 8);
+        }
+    } else {
+        cudaGetLastError();
+    }
+
+    return qBound(2, adaptive, qMin(depth, 64));
+}
+
+bool slabHasIsoCrossing(
+    const QVector<QVector<QVector<float>>>& volume,
+    int zStart,
+    int zEnd,
+    float isoLevel
+) {
+    bool seenBelow = false;
+    bool seenAboveOrEqual = false;
+
+    for (int z = zStart; z <= zEnd; ++z) {
+        const auto& slice = volume[z];
+        for (int y = 0; y < slice.size(); ++y) {
+            const auto& row = slice[y];
+            for (int x = 0; x < row.size(); ++x) {
+                const float v = row[x];
+                if (v < isoLevel) {
+                    seenBelow = true;
+                } else {
+                    seenAboveOrEqual = true;
+                }
+                if (seenBelow && seenAboveOrEqual) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
 }
 
 // CUDA constant memory for lookup tables
@@ -677,7 +766,7 @@ MarchingCubes::Mesh MarchingCubes::generateMeshStreaming(
         return merged;
     }
 
-    const int effectiveSlabDepth = qMax(2, slabDepth);
+    const int effectiveSlabDepth = chooseAdaptiveSlabDepth(slabDepth, depth);
     if (depth <= effectiveSlabDepth) {
         return generateMesh(volume, isoLevel, spacingX, spacingY, spacingZ);
     }
@@ -685,10 +774,23 @@ MarchingCubes::Mesh MarchingCubes::generateMeshStreaming(
     qDebug() << "Streaming Marching Cubes with slab depth" << effectiveSlabDepth
              << "on full volume depth" << depth;
 
+    const float seamTolerance = qMax(1e-5f, spacingZ * 0.40f);
+    const float quantizeEps = qMax(1e-5f, qMin(spacingX, qMin(spacingY, spacingZ)) * 0.02f);
+    std::unordered_map<QuantizedVertexKey, unsigned int, QuantizedVertexKeyHash> seamVertexMap;
+
     int zStart = 0;
     while (zStart < depth - 1) {
         const int zEnd = qMin(depth - 1, zStart + effectiveSlabDepth - 1);
         const int localDepth = zEnd - zStart + 1;
+
+        if (!slabHasIsoCrossing(volume, zStart, zEnd, isoLevel)) {
+            qDebug() << "Skipping empty slab z" << zStart << "to" << zEnd << "(no iso crossing)";
+            if (zEnd == depth - 1) {
+                break;
+            }
+            zStart = zEnd;
+            continue;
+        }
 
         QVector<QVector<QVector<float>>> slab;
         slab.resize(localDepth);
@@ -698,16 +800,63 @@ MarchingCubes::Mesh MarchingCubes::generateMeshStreaming(
 
         Mesh slabMesh = generateMesh(slab, isoLevel, spacingX, spacingY, spacingZ);
         if (!slabMesh.vertices.isEmpty()) {
-            const unsigned int baseIndex = static_cast<unsigned int>(merged.vertices.size());
+            QVector<unsigned int> remap;
+            remap.resize(slabMesh.vertices.size());
+
+            std::unordered_map<QuantizedVertexKey, unsigned int, QuantizedVertexKeyHash> localVertexMap;
+            localVertexMap.reserve(static_cast<std::size_t>(slabMesh.vertices.size() * 1.2));
 
             merged.vertices.reserve(merged.vertices.size() + slabMesh.vertices.size());
-            for (const QVector3D& v : slabMesh.vertices) {
-                merged.vertices.append(QVector3D(v.x(), v.y(), v.z() + (static_cast<float>(zStart) * spacingZ)));
+            for (int i = 0; i < slabMesh.vertices.size(); ++i) {
+                const QVector3D globalV(
+                    slabMesh.vertices[i].x(),
+                    slabMesh.vertices[i].y(),
+                    slabMesh.vertices[i].z() + (static_cast<float>(zStart) * spacingZ)
+                );
+
+                const QuantizedVertexKey key = quantizeVertex(globalV, quantizeEps);
+                bool reused = false;
+
+                if (zStart > 0 && qAbs(globalV.z() - (static_cast<float>(zStart) * spacingZ)) <= seamTolerance) {
+                    const auto seamIt = seamVertexMap.find(key);
+                    if (seamIt != seamVertexMap.end()) {
+                        remap[i] = seamIt->second;
+                        reused = true;
+                    }
+                }
+
+                if (!reused) {
+                    const auto localIt = localVertexMap.find(key);
+                    if (localIt != localVertexMap.end()) {
+                        remap[i] = localIt->second;
+                    } else {
+                        const unsigned int newIndex = static_cast<unsigned int>(merged.vertices.size());
+                        merged.vertices.append(globalV);
+                        localVertexMap.emplace(key, newIndex);
+                        remap[i] = newIndex;
+                    }
+                }
             }
 
             merged.indices.reserve(merged.indices.size() + slabMesh.indices.size());
             for (unsigned int idx : slabMesh.indices) {
-                merged.indices.append(baseIndex + idx);
+                if (idx < static_cast<unsigned int>(remap.size())) {
+                    merged.indices.append(remap[static_cast<int>(idx)]);
+                }
+            }
+
+            seamVertexMap.clear();
+            seamVertexMap.reserve(localVertexMap.size() / 3 + 1024);
+            const float upperSeamZ = static_cast<float>(zEnd) * spacingZ;
+            for (int i = 0; i < slabMesh.vertices.size(); ++i) {
+                const unsigned int mapped = remap[i];
+                if (mapped >= static_cast<unsigned int>(merged.vertices.size())) {
+                    continue;
+                }
+                const QVector3D& gv = merged.vertices[static_cast<int>(mapped)];
+                if (qAbs(gv.z() - upperSeamZ) <= seamTolerance) {
+                    seamVertexMap.emplace(quantizeVertex(gv, quantizeEps), mapped);
+                }
             }
         }
 
