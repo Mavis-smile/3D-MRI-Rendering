@@ -34,7 +34,6 @@
 #include <QProgressDialog>
 #include <QFutureWatcher>
 #include <QSpinBox>
-#include <QComboBox>
 #include <QtConcurrent/QtConcurrent>
 #include <functional>
 
@@ -59,9 +58,7 @@ private slots:
     void exportSTL();
     void onThreshold16Changed(int value);
     void onThreshold16Auto();
-    void onPreviewMask();
     void onOtsuComputationFinished();
-    void onSmoothingIntensityChanged(int value);
     void handleMeshGenerationStarted();
     void handleMeshComputationFinished();
     void handleMeshRenderingFinished();
@@ -83,11 +80,7 @@ private:
     void syncThresholdControls();
     QSpinBox* threshold16SpinBox;
     QPushButton* threshold16AutoButton;
-    QPushButton* previewMaskButton;
     QLabel* thresholdLabel;
-    QComboBox* polarityModeComboBox;
-    QSlider* smoothingIntensitySlider;
-    QLabel* smoothingLabel;
     QAction* generate3DAct;
     double currentThreshold = 0.43;
     static constexpr int kDefaultThreshold16 = 28180;
@@ -142,7 +135,6 @@ private:
     float voxelSpacingX = 0.30f;
     float voxelSpacingY = 0.30f;
     float voxelSpacingZ = 0.50f;
-    float currentSmoothingIntensity = 0.0f;
 
     // Adaptive image processing
     ImageProcessor imageProcessor;

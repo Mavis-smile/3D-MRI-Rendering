@@ -577,6 +577,7 @@ MarchingCubes::Mesh MarchingCubes::generateMesh(
     dim3 blocks(1, 1, 1);
     int h_triangleCount = 0;
     int copyVertexCount = 0;
+    int triangleAlignedCount = 0;
 
     // (a) Copy lookup tables to constant device memory
     if (!checkCuda(cudaMemcpyToSymbol(d_edgeTable, edgeTable, sizeof(edgeTable)), "cudaMemcpyToSymbol(edgeTable)")) {
@@ -699,6 +700,19 @@ MarchingCubes::Mesh MarchingCubes::generateMesh(
         copyVertexCount = maxVertices;
     }
 
+    // Keep the output strictly triangle-aligned. Truncation can leave dangling vertices.
+    triangleAlignedCount = (copyVertexCount / 3) * 3;
+    if (triangleAlignedCount != copyVertexCount) {
+        qWarning() << "Dropping" << (copyVertexCount - triangleAlignedCount)
+                   << "dangling vertex/vertices to keep triangle alignment.";
+        copyVertexCount = triangleAlignedCount;
+    }
+
+    if (copyVertexCount <= 0) {
+        qWarning() << "Marching Cubes output became empty after triangle alignment.";
+        goto cleanup;
+    }
+
     // (g) Copy generated mesh vertices back to host
     h_vertices = new float3[copyVertexCount];
     if (!checkCuda(cudaMemcpy(h_vertices, d_vertices, static_cast<size_t>(copyVertexCount) * sizeof(float3), cudaMemcpyDeviceToHost),
@@ -774,8 +788,8 @@ MarchingCubes::Mesh MarchingCubes::generateMeshStreaming(
     qDebug() << "Streaming Marching Cubes with slab depth" << effectiveSlabDepth
              << "on full volume depth" << depth;
 
-    const float seamTolerance = qMax(1e-5f, spacingZ * 0.40f);
-    const float quantizeEps = qMax(1e-5f, qMin(spacingX, qMin(spacingY, spacingZ)) * 0.02f);
+    const float seamTolerance = qMax(1e-5f, spacingZ * 0.12f);
+    const float quantizeEps = qMax(1e-5f, qMin(spacingX, qMin(spacingY, spacingZ)) * 0.005f);
     std::unordered_map<QuantizedVertexKey, unsigned int, QuantizedVertexKeyHash> seamVertexMap;
 
     int zStart = 0;

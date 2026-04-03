@@ -225,7 +225,7 @@ void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsi
     ibo.allocate(indices.constData(), static_cast<int>(indices.size() * sizeof(unsigned int)));
     qDebug() << "Index buffer size:" << ibo.size() << "bytes";
 
-    indexCount = indices.size();
+    indexCount = static_cast<size_t>(indices.size());
 
     // Calculate mesh bounds
     if (!vertices.isEmpty()) {
@@ -446,7 +446,7 @@ void GLWidget::exportMeshToFiles(const QVector<unsigned int>& indices, const QVe
     QFile facesFile("faces.txt");
     if (facesFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
         QTextStream out(&facesFile);
-        for (int i = 0; i < indices.size(); i += 3) {
+        for (int i = 0; i + 2 < indices.size(); i += 3) {
             // Skip invalid faces
             if (indices[i] >= vertices.size() ||
                 indices[i+1] >= vertices.size() ||

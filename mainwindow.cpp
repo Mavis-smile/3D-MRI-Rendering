@@ -142,26 +142,103 @@ cv::Mat qImageToSegmentationU16(const QImage& image) {
     return mat16;
 }
 
-cv::Mat cropSegmentationSlice16(const cv::Mat& src) {
+cv::Rect detectSegmentationCropRect(const cv::Mat& src) {
+    if (src.empty()) {
+        return cv::Rect();
+    }
+
+    cv::Mat gray = src;
+    if (src.channels() == 3) {
+        cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    } else if (src.channels() == 4) {
+        cv::cvtColor(src, gray, cv::COLOR_BGRA2GRAY);
+    }
+
+    cv::Mat normalized8;
+    if (gray.depth() == CV_16U) {
+        double minValue = 0.0;
+        double maxValue = 0.0;
+        cv::minMaxLoc(gray, &minValue, &maxValue);
+        if (maxValue > minValue) {
+            gray.convertTo(normalized8, CV_8UC1, 255.0 / (maxValue - minValue), -minValue * 255.0 / (maxValue - minValue));
+        } else {
+            normalized8 = cv::Mat(gray.size(), CV_8UC1, cv::Scalar(0));
+        }
+    } else if (gray.depth() == CV_8U) {
+        normalized8 = gray;
+    } else {
+        gray.convertTo(normalized8, CV_8UC1);
+    }
+
+    cv::GaussianBlur(normalized8, normalized8, cv::Size(3, 3), 0.0, 0.0);
+
+    cv::Mat binary;
+    cv::threshold(normalized8, binary, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(binary.clone(), contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    if (contours.empty()) {
+        return cv::Rect();
+    }
+
+    cv::Rect boundingRectUnion;
+    bool hasValidContour = false;
+    for (const auto& contour : contours) {
+        const cv::Rect rect = cv::boundingRect(contour);
+        const bool touchesBorder = (rect.x <= 1)
+            || (rect.y <= 1)
+            || (rect.x + rect.width >= src.cols - 1)
+            || (rect.y + rect.height >= src.rows - 1);
+        if (touchesBorder) {
+            continue;
+        }
+        if (rect.area() < (src.cols * src.rows / 500)) {
+            continue;
+        }
+
+        if (!hasValidContour) {
+            boundingRectUnion = rect;
+            hasValidContour = true;
+        } else {
+            boundingRectUnion |= rect;
+        }
+    }
+
+    if (!hasValidContour) {
+        return cv::Rect();
+    }
+
+    const int marginX = qMax(4, boundingRectUnion.width / 30);
+    const int marginY = qMax(4, boundingRectUnion.height / 30);
+    const QRect cropRect(
+        qMax(0, boundingRectUnion.x - marginX),
+        qMax(0, boundingRectUnion.y - marginY),
+        qMin(src.cols - qMax(0, boundingRectUnion.x - marginX), boundingRectUnion.width + 2 * marginX),
+        qMin(src.rows - qMax(0, boundingRectUnion.y - marginY), boundingRectUnion.height + 2 * marginY)
+    );
+
+    if (cropRect.width() <= 0 || cropRect.height() <= 0) {
+        return cv::Rect();
+    }
+
+    return cv::Rect(cropRect.x(), cropRect.y(), cropRect.width(), cropRect.height());
+}
+
+cv::Mat cropSegmentationSlice16(const cv::Mat& src, const cv::Rect& cropRect) {
     if (src.empty()) {
         return cv::Mat();
     }
 
-    const int x = 45;
-    const int y = 48;
-    const int w = 1417;
-    const int h = 537;
-
-    const int x0 = qBound(0, x, src.cols);
-    const int y0 = qBound(0, y, src.rows);
-    const int x1 = qBound(0, x + w, src.cols);
-    const int y1 = qBound(0, y + h, src.rows);
-
-    if (x1 <= x0 || y1 <= y0) {
+    if (cropRect.width <= 0 || cropRect.height <= 0) {
         return src.clone();
     }
 
-    return src(cv::Rect(x0, y0, x1 - x0, y1 - y0)).clone();
+    const cv::Rect boundedRect = cropRect & cv::Rect(0, 0, src.cols, src.rows);
+    if (boundedRect.width <= 0 || boundedRect.height <= 0) {
+        return src.clone();
+    }
+
+    return src(boundedRect).clone();
 }
 
 int histogramPercentile(const std::vector<qint64>& histogram, qint64 total, double pct) {
@@ -178,165 +255,6 @@ int histogramPercentile(const std::vector<qint64>& histogram, qint64 total, doub
         }
     }
     return int(histogram.size()) - 1;
-}
-
-cv::Mat cleanupBinaryMask16(const cv::Mat& inputMask, bool sparseDepth, bool denseDepth) {
-    if (inputMask.empty()) {
-        return cv::Mat();
-    }
-
-    cv::Mat mask = inputMask.clone();
-    const int rows = mask.rows;
-    const int cols = mask.cols;
-    const int totalPixels = rows * cols;
-
-    // Hard suppress image borders to avoid slab artifacts from scanner frame/background.
-    const int borderY = qMax(2, rows / 35);
-    const int borderX = qMax(2, cols / 35);
-    mask.rowRange(0, borderY).setTo(0);
-    mask.rowRange(rows - borderY, rows).setTo(0);
-    mask.colRange(0, borderX).setTo(0);
-    mask.colRange(cols - borderX, cols).setTo(0);
-
-    const cv::Mat kernelSmall = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    if (!sparseDepth) {
-        cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernelSmall);
-    }
-    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernelSmall);
-
-    cv::Mat labels;
-    cv::Mat stats;
-    cv::Mat centroids;
-    const int componentCount = cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8, CV_32S);
-    if (componentCount <= 1) {
-        return mask;
-    }
-
-    struct Candidate {
-        int label = 0;
-        double score = 0.0;
-    };
-
-    const int minComponentArea = sparseDepth
-        ? qMax(12, totalPixels / 25000)
-        : (denseDepth ? qMax(220, totalPixels / 2200) : qMax(80, totalPixels / 4000));
-
-    QVector<Candidate> candidates;
-    candidates.reserve(componentCount - 1);
-
-    for (int label = 1; label < componentCount; ++label) {
-        const int area = stats.at<int>(label, cv::CC_STAT_AREA);
-        if (area < minComponentArea) {
-            continue;
-        }
-
-        const int left = stats.at<int>(label, cv::CC_STAT_LEFT);
-        const int top = stats.at<int>(label, cv::CC_STAT_TOP);
-        const int compWidth = stats.at<int>(label, cv::CC_STAT_WIDTH);
-        const int compHeight = stats.at<int>(label, cv::CC_STAT_HEIGHT);
-        const int centerX = left + compWidth / 2;
-        const int centerY = top + compHeight / 2;
-
-        const bool touchesLeft = (left <= 1);
-        const bool touchesRight = (left + compWidth >= cols - 1);
-        const bool touchesTop = (top <= 1);
-        const bool touchesBottom = (top + compHeight >= rows - 1);
-        const int borderTouchCount = int(touchesLeft) + int(touchesRight) + int(touchesTop) + int(touchesBottom);
-
-        if (borderTouchCount >= 3 && area > (totalPixels / 12)) {
-            continue;
-        }
-
-        const double areaScore = double(area) / double(totalPixels);
-        const double centerXScore = 1.0 - qAbs(double(centerX) - (double(cols) * 0.5)) / (double(cols) * 0.5 + 1e-6);
-        const double centerYScore = 1.0 - qAbs(double(centerY) - (double(rows) * 0.5)) / (double(rows) * 0.5 + 1e-6);
-        const double score = (0.68 * areaScore) + (0.18 * centerXScore) + (0.14 * centerYScore);
-        candidates.append({label, score});
-    }
-
-    cv::Mat filteredMask = cv::Mat::zeros(mask.size(), CV_8UC1);
-    if (!candidates.isEmpty()) {
-        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-            return a.score > b.score;
-        });
-
-        const int targetKeepCount = sparseDepth ? 4 : (denseDepth ? 1 : 2);
-        const int keepCount = qMin(targetKeepCount, candidates.size());
-        for (int i = 0; i < keepCount; ++i) {
-            filteredMask.setTo(255, labels == candidates[i].label);
-        }
-    } else {
-        int maxLabel = 1;
-        int maxArea = stats.at<int>(1, cv::CC_STAT_AREA);
-        for (int label = 2; label < componentCount; ++label) {
-            const int area = stats.at<int>(label, cv::CC_STAT_AREA);
-            if (area > maxArea) {
-                maxArea = area;
-                maxLabel = label;
-            }
-        }
-        filteredMask.setTo(255, labels == maxLabel);
-    }
-
-    const cv::Size closeSize = sparseDepth ? cv::Size(11, 5) : (denseDepth ? cv::Size(19, 9) : cv::Size(13, 7));
-    const cv::Mat kernelClose = cv::getStructuringElement(cv::MORPH_ELLIPSE, closeSize);
-    cv::morphologyEx(filteredMask, filteredMask, cv::MORPH_CLOSE, kernelClose);
-    cv::morphologyEx(filteredMask, filteredMask, cv::MORPH_OPEN, kernelSmall);
-    return filteredMask;
-}
-
-bool detectForegroundIsDark(const QVector<cv::Mat>& slices16) {
-    if (slices16.isEmpty()) {
-        return false;
-    }
-
-    double centerAccum = 0.0;
-    double borderAccum = 0.0;
-    qint64 centerCount = 0;
-    qint64 borderCount = 0;
-
-    const int zStep = qMax(1, slices16.size() / 24);
-    for (int z = 0; z < slices16.size(); z += zStep) {
-        cv::Mat u16;
-        if (slices16[z].type() == CV_16UC1) {
-            u16 = slices16[z];
-        } else {
-            slices16[z].convertTo(u16, CV_16UC1);
-        }
-
-        if (u16.empty()) {
-            continue;
-        }
-
-        const int rows = u16.rows;
-        const int cols = u16.cols;
-        const int cx0 = cols / 5;
-        const int cx1 = cols - cx0;
-        const int cy0 = rows / 5;
-        const int cy1 = rows - cy0;
-
-        for (int y = 0; y < rows; ++y) {
-            const quint16* row = reinterpret_cast<const quint16*>(u16.ptr(y));
-            for (int x = 0; x < cols; ++x) {
-                const bool inCenter = (x >= cx0 && x < cx1 && y >= cy0 && y < cy1);
-                if (inCenter) {
-                    centerAccum += row[x];
-                    ++centerCount;
-                } else {
-                    borderAccum += row[x];
-                    ++borderCount;
-                }
-            }
-        }
-    }
-
-    if (centerCount == 0 || borderCount == 0) {
-        return false;
-    }
-
-    const double centerMean = centerAccum / double(centerCount);
-    const double borderMean = borderAccum / double(borderCount);
-    return (centerMean + 300.0) < borderMean;
 }
 
 int computeOtsuThreshold16FromSlices(const QVector<cv::Mat>& slices16) {
@@ -1160,25 +1078,6 @@ void MainWindow::createToolbar() {
     threshold16AutoButton->setMinimumWidth(60);
     threshold16AutoButton->setVisible(true);
 
-    polarityModeComboBox = new QComboBox(this);
-    polarityModeComboBox->addItem("Polarity: Auto");
-    polarityModeComboBox->addItem("Polarity: Object Darker");
-    polarityModeComboBox->addItem("Polarity: Object Brighter");
-    polarityModeComboBox->setCurrentIndex(0);
-    polarityModeComboBox->setMinimumWidth(165);
-
-    previewMaskButton = new QPushButton("Preview Mask", this);
-    previewMaskButton->setMinimumWidth(95);
-
-    smoothingLabel = new QLabel("Smoothing: 0%", this);
-    smoothingLabel->setMinimumWidth(95);
-    
-    smoothingIntensitySlider = new QSlider(Qt::Horizontal, this);
-    smoothingIntensitySlider->setRange(0, 100);
-    smoothingIntensitySlider->setValue(0);
-    smoothingIntensitySlider->setMinimumWidth(90);
-    smoothingIntensitySlider->setMaximumWidth(110);
-
     // Create container widget for segmentation controls
     QWidget* segmentationWidget = new QWidget(this);
     QVBoxLayout* segmentationLayout = new QVBoxLayout(segmentationWidget);
@@ -1194,16 +1093,11 @@ void MainWindow::createToolbar() {
     controlsLayout->addWidget(thresholdLabel, 0);
     controlsLayout->addWidget(threshold16SpinBox, 0);
 
-    // Second row: Auto, Preview, and Smoothing controls
+    // Second row: Auto threshold control
     QHBoxLayout* buttonsLayout = new QHBoxLayout();
     buttonsLayout->setContentsMargins(0, 0, 0, 0);
     buttonsLayout->setSpacing(5);
     buttonsLayout->addWidget(threshold16AutoButton, 0);
-    buttonsLayout->addWidget(polarityModeComboBox, 0);
-    buttonsLayout->addWidget(previewMaskButton, 0);
-    buttonsLayout->addWidget(new QLabel("", this), 0);  // Spacer
-    buttonsLayout->addWidget(smoothingLabel, 0);
-    buttonsLayout->addWidget(smoothingIntensitySlider, 0);
     buttonsLayout->addStretch(1);
 
     segmentationLayout->addLayout(controlsLayout);
@@ -1220,15 +1114,6 @@ void MainWindow::createToolbar() {
             this,
             &MainWindow::onThreshold16Changed);
     connect(threshold16AutoButton, &QPushButton::clicked, this, &MainWindow::onThreshold16Auto);
-    connect(polarityModeComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, [this](int idx) {
-                const QString mode = (idx == 1) ? "manual dark-foreground"
-                                                : (idx == 2) ? "manual bright-foreground"
-                                                             : "auto polarity";
-                statusBar()->showMessage(QString("Polarity mode set to %1").arg(mode), 2500);
-            });
-    connect(previewMaskButton, &QPushButton::clicked, this, &MainWindow::onPreviewMask);
-    connect(smoothingIntensitySlider, QOverload<int>::of(&QSlider::valueChanged), this, &MainWindow::onSmoothingIntensityChanged);
 
         syncThresholdControls();
 }
@@ -1241,7 +1126,12 @@ void MainWindow::openDataset() {
     dialog.setOption(QFileDialog::ShowDirsOnly, true); // Only show directories
 
     if (dialog.exec() == QDialog::Accepted) {
-        QString folderPath = dialog.selectedFiles().first(); // Get the selected folder path
+        const QStringList selected = dialog.selectedFiles();
+        if (selected.isEmpty()) {
+            QMessageBox::warning(this, "No Folder Selected", "No dataset folder was selected.");
+            return;
+        }
+        QString folderPath = selected.first(); // Get the selected folder path
         QDir dir(folderPath);
 
         // Filter for image files and enforce numeric ordering by slice number in filenames.
@@ -1309,12 +1199,21 @@ void MainWindow::loadImages(const QStringList& filePaths) {
         LoadedSliceResult result;
         result.index = index;
 
+        if (index < 0 || index >= filePaths.size()) {
+            qWarning() << "Slice index out of range during async load:" << index << "size:" << filePaths.size();
+            return result;
+        }
+
         bool usedFallback = false;
         const QImage originalImg = loadSliceImage(filePaths[index], &usedFallback);
         if (originalImg.isNull()) {
             qWarning() << "Failed to decode image (Qt/OpenCV):" << filePaths[index];
             return result;
         }
+
+
+
+        
 
         if (usedFallback) {
             static std::atomic<int> fallbackLogCount{0};
@@ -1329,10 +1228,6 @@ void MainWindow::loadImages(const QStringList& filePaths) {
             result.segmentation16 = qImageToSegmentationU16(originalImg);
             result.hasNative16 = false;
         }
-        // Keep the 16-bit mesh path aligned with the same ROI used in preview preprocessing.
-        // Without this crop, scanner frame/slab background dominates meshing and hides anatomy.
-        result.segmentation16 = cropSegmentationSlice16(result.segmentation16);
-
         result.valid = !result.processed.isNull();
         return result;
     }));
@@ -1369,6 +1264,39 @@ void MainWindow::loadImages(const QStringList& filePaths) {
         segmentationSlices16.append(result.segmentation16.clone());
     }
 
+    if (!segmentationSlices16.isEmpty()) {
+        cv::Rect sharedCropRect;
+        bool haveSharedCrop = false;
+        for (const cv::Mat& slice16 : segmentationSlices16) {
+            const cv::Rect detectedRect = detectSegmentationCropRect(slice16);
+            if (detectedRect.width <= 0 || detectedRect.height <= 0) {
+                continue;
+            }
+            if (!haveSharedCrop) {
+                sharedCropRect = detectedRect;
+                haveSharedCrop = true;
+            } else {
+                sharedCropRect |= detectedRect;
+            }
+        }
+
+        if (haveSharedCrop && sharedCropRect.width > 0 && sharedCropRect.height > 0) {
+            const cv::Rect imageBounds(0, 0, segmentationSlices16.first().cols, segmentationSlices16.first().rows);
+            sharedCropRect &= imageBounds;
+
+                if (sharedCropRect.width > 0 && sharedCropRect.height > 0) {
+                QVector<cv::Mat> croppedSlices;
+                croppedSlices.reserve(segmentationSlices16.size());
+                for (const cv::Mat& slice16 : segmentationSlices16) {
+                    croppedSlices.append(cropSegmentationSlice16(slice16, sharedCropRect));
+                }
+                segmentationSlices16 = croppedSlices;
+                qDebug() << "Applied shared 16-bit crop:" << QRect(sharedCropRect.x, sharedCropRect.y, sharedCropRect.width, sharedCropRect.height)
+                         << "for" << segmentationSlices16.size() << "slice(s)";
+            }
+        }
+    }
+
     hasSegmentation16Data = (!segmentationSlices16.isEmpty() && segmentationSlices16.size() == loadedImages.size());
 
     qDebug() << "Segmentation ingestion:" << segmentationSlices16.size() << "slice(s),"
@@ -1395,20 +1323,24 @@ void MainWindow::loadImages(const QStringList& filePaths) {
         }
 
         const QString msg = (failedCount > 0)
-            ? QString("Loaded %1 image(s). %2 file(s) could not be decoded. Seg16: %3/%4 native. Threshold reset to %5.")
+            ? QString("Loaded %1 image(s). %2 file(s) could not be decoded. Seg16: %3/%4 native. Threshold remains %5.")
                 .arg(loadedImages.size()).arg(failedCount).arg(native16Count).arg(segmentationSlices16.size()).arg(currentThreshold16)
-            : QString("Images loaded successfully (%1 slices). Seg16 native: %2/%3. Threshold reset to %4.")
+            : QString("Images loaded successfully (%1 slices). Seg16 native: %2/%3. Threshold remains %4.")
                 .arg(loadedImages.size()).arg(native16Count).arg(segmentationSlices16.size()).arg(currentThreshold16);
         statusBar()->showMessage(msg, 5000);
         updateImagePreviews();
-        mainTabs->setCurrentIndex(1);  // Switch to preview tab
+        if (mainTabs && mainTabs->count() > 1) {
+            mainTabs->setCurrentIndex(1);  // Switch to preview tab
+        }
     } else {
         statusBar()->showMessage(
             QString("No valid images loaded (%1 file(s) failed to decode). "
                     "Compressed DICOM (JPEG/JPEG2000) is not supported.").arg(failedCount),
             8000);
         updateImagePreviews();      // Shows the informative empty-state label
-        mainTabs->setCurrentIndex(1); // Switch to preview tab so the message is visible
+        if (mainTabs && mainTabs->count() > 1) {
+            mainTabs->setCurrentIndex(1); // Switch to preview tab so the message is visible
+        }
     }
 
 }
@@ -1424,7 +1356,12 @@ void MainWindow::updateImagePreviews() {
         delete item;
     }
 
-    if (originalImages.isEmpty()) {
+    const QVector<QImage>& previewImages =
+        (!originalImages.isEmpty() && originalImages.size() == loadedImages.size())
+            ? originalImages
+            : loadedImages;
+
+    if (previewImages.isEmpty()) {
         QLabel* emptyLabel = new QLabel(
             "No valid images loaded.\n\n"
             "Supported: uncompressed 8-bit or 16-bit monochrome DICOM\n"
@@ -1437,13 +1374,13 @@ void MainWindow::updateImagePreviews() {
         return;
     }
 
-    // Use originalImages instead of loadedImages
+    // Preview tab should display original source slices.
     const int thumbsPerRow = 4;
     const int thumbSize = 200;
 
-    for (int i = 0; i < originalImages.size(); ++i) {
+    for (int i = 0; i < previewImages.size(); ++i) {
         QLabel* thumbLabel = new QLabel;
-        QImage thumb = originalImages[i].scaled(thumbSize, thumbSize,
+        QImage thumb = previewImages[i].scaled(thumbSize, thumbSize,
                                                 Qt::KeepAspectRatio,
                                                 Qt::SmoothTransformation);
 
@@ -1466,9 +1403,14 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
         if (mouseEvent->button() == Qt::LeftButton) {
             QLabel* label = qobject_cast<QLabel*>(watched);
             if (label) {
-                int index = label->property("imageIndex").toInt();
-                if (index >= 0 && index < originalImages.size()) {  // Check originalImages size
-                    showFullSizeImage(originalImages[index]);  // Pass original image
+                bool ok = false;
+                int index = label->property("imageIndex").toInt(&ok);
+                const QVector<QImage>& previewImages =
+                    (!originalImages.isEmpty() && originalImages.size() == loadedImages.size())
+                        ? originalImages
+                        : loadedImages;
+                if (ok && index >= 0 && index < previewImages.size()) {
+                    showFullSizeImage(previewImages[index]);
                     return true;
                 }
             }
@@ -1523,8 +1465,68 @@ QImage MainWindow::preprocessLoadedImage(const QImage& input, const QString& pat
         return QImage();
     }
 
-    // Fixed ROI used by the existing workflow.
+    // Adaptive ROI detection: Use hardcoded crop as fallback, but detect content region for TIFF/variable-sized inputs.
     QRect cropRect(45, 48, 1417, 537);
+    
+    // Convert input to CV for content detection
+    cv::Mat inputMat = QImageToCvMat(input);
+    if (!inputMat.empty()) {
+        // Apply Otsu to find content threshold dynamically
+        cv::Mat grayInput = inputMat.channels() == 3 ? cv::Mat() : inputMat.clone();
+        if (inputMat.channels() == 3) {
+            cv::cvtColor(inputMat, grayInput, cv::COLOR_BGR2GRAY);
+        }
+        
+        cv::Mat binaryContent;
+        cv::threshold(grayInput, binaryContent, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+        
+        // Find contours indicating actual scan content
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(binaryContent.clone(), contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+        
+        if (!contours.empty()) {
+            // Get bounding box of all significant contours.
+            int minX = input.width(), maxX = 0;
+            int minY = input.height(), maxY = 0;
+            
+            for (const auto& contour : contours) {
+                cv::Rect boundingBox = cv::boundingRect(contour);
+                const bool touchesBorder = (boundingBox.x <= 1)
+                    || (boundingBox.y <= 1)
+                    || (boundingBox.x + boundingBox.width >= input.width() - 1)
+                    || (boundingBox.y + boundingBox.height >= input.height() - 1);
+                if (touchesBorder) {
+                    continue;
+                }
+                if (boundingBox.area() > (input.width() * input.height() / 500)) { // Filter noise
+                    minX = qMin(minX, boundingBox.x);
+                    maxX = qMax(maxX, boundingBox.x + boundingBox.width);
+                    minY = qMin(minY, boundingBox.y);
+                    maxY = qMax(maxY, boundingBox.y + boundingBox.height);
+                }
+            }
+            
+            // Use detected ROI if it's valid and larger than the hardcoded one
+            if (minX < maxX && minY < maxY) {
+                int detectedWidth = maxX - minX;
+                int detectedHeight = maxY - minY;
+                
+                // Only switch to detected ROI if content region is reasonably large
+                if (detectedWidth > 400 && detectedHeight > 150) {
+                    // Add small margin and apply padding
+                    int margin = qMax(5, qMin(detectedWidth, detectedHeight) / 50);
+                    cropRect = QRect(
+                        qMax(0, minX - margin),
+                        qMax(0, minY - margin),
+                        qMin(input.width(), detectedWidth + 2 * margin),
+                        qMin(input.height(), detectedHeight + 2 * margin)
+                    );
+                    qDebug() << "Adaptive ROI detected:" << cropRect << "for" << path;
+                }
+            }
+        }
+    }
+    
     cropRect = cropRect.intersected(input.rect());
     if (cropRect.isEmpty()) {
         qWarning() << "Crop ROI is outside image bounds for" << path;
@@ -1605,7 +1607,12 @@ QImage MainWindow::preprocessLoadedImage(const QImage& input, const QString& pat
             const bool thinHorizontalStrip = (height <= qMax(3, rows / 26)) && (width >= (cols * 3 / 5));
 
             // Reject frame/slab artifacts that dominate image borders.
-            if (borderTouchCount >= 3 && area > (totalPixels / 12)) {
+            // For sparse stacks, be more lenient with border touching (jaw can legitimately extend to edges).
+            const int borderRejectThreshold = sparseStack ? 4 : 3;
+            const int borderAreaThreshold = sparseStack ? (totalPixels / 8) : (totalPixels / 12);
+            const bool frameLike = (borderTouchCount >= 2)
+                && ((width >= (cols * 3 / 5)) || (height >= (rows * 3 / 5)) || (area > borderAreaThreshold));
+            if (frameLike || (borderTouchCount >= borderRejectThreshold && area > borderAreaThreshold)) {
                 continue;
             }
             // Dense stacks often contain bright horizontal streak artifacts.
@@ -1613,11 +1620,15 @@ QImage MainWindow::preprocessLoadedImage(const QImage& input, const QString& pat
             if (denseStack && thinHorizontalStrip && area < (totalPixels / 24)) {
                 continue;
             }
-            if (height > (rows * 17 / 20) && area > (totalPixels / 14)) {
+            // Relax tall-component rejection for sparse stacks where jaw extends nearly full height
+            const int heightRejectRatio = sparseStack ? 9 : 20;  // sparse: 9/10, dense: 17/20
+            const int heightAreaThreshold = sparseStack ? (totalPixels / 10) : (totalPixels / 14);
+            if (height > (rows * heightRejectRatio / 10) && area > heightAreaThreshold) {
                 continue;
             }
-            const int topRejectBand = sparseStack ? (rows / 14) : (rows / 8);
-            if (centerY < topRejectBand && area > (totalPixels / 220)) {
+            const int topRejectBand = sparseStack ? (rows / 10) : (rows / 8);  // Wider acceptance zone for sparse
+            const int topAreaThreshold = sparseStack ? (totalPixels / 150) : (totalPixels / 220);
+            if (centerY < topRejectBand && area > topAreaThreshold) {
                 continue;
             }
             if (denseStack && centerY > (rows * 9 / 10) && area < (totalPixels / 100)) {
@@ -1754,59 +1765,10 @@ MainWindow::VolumeData MainWindow::convertToVolume(const QVector<QImage>& images
         }
     }
 
-    // Preserve full dataset fidelity for medical 3D reconstruction.
+    // Active production path: keep binary thresholded volume for stable presentation behavior.
     const int width = srcWidth;
     const int height = srcHeight;
-    const float smoothingIntensity = 1.0f;  // Legacy 8-bit path uses full smoothing
-    const bool sparseInput = (srcDepth <= 48);
-
-    QVector<int> zStepCounts;
-    zStepCounts.reserve(qMax(0, srcDepth - 1));
-    int depth = srcDepth;
-    bool interpolatedSparseGaps = false;
-
-    if (sparseInput && currentImagePaths.size() == srcDepth && srcDepth >= 2) {
-        bool allNumbersValid = true;
-        int totalGapDepth = 1;
-        QVector<int> observedGaps;
-        observedGaps.reserve(srcDepth - 1);
-
-        for (int i = 0; i + 1 < currentImagePaths.size(); ++i) {
-            bool okA = false;
-            bool okB = false;
-            const QFileInfo fileA(currentImagePaths[i]);
-            const QFileInfo fileB(currentImagePaths[i + 1]);
-            const int sliceA = extractLastNumber(fileA.completeBaseName(), &okA);
-            const int sliceB = extractLastNumber(fileB.completeBaseName(), &okB);
-            if (!okA || !okB) {
-                allNumbersValid = false;
-                break;
-            }
-
-            const int rawGap = qMax(1, sliceB - sliceA);
-            const int clampedGap = qBound(1, rawGap, 8);
-            zStepCounts.append(clampedGap);
-            observedGaps.append(rawGap);
-            totalGapDepth += clampedGap;
-        }
-
-        if (allNumbersValid && !observedGaps.isEmpty()) {
-            QVector<int> sortedGaps = observedGaps;
-            std::sort(sortedGaps.begin(), sortedGaps.end());
-            const int medianGap = sortedGaps[sortedGaps.size() / 2];
-            if (medianGap > 1) {
-                depth = totalGapDepth;
-                interpolatedSparseGaps = true;
-                qDebug() << "Sparse stack appears subsampled; interpolating Z gaps."
-                         << "median gap:" << medianGap
-                         << "depth:" << srcDepth << "->" << depth;
-            }
-        }
-    }
-
-    const bool sparseDepth = sparseInput;
-    const bool denseDepth = (!sparseInput && depth >= 200);
-    const QString depthProfile = sparseDepth ? "sparse" : (denseDepth ? "dense" : "balanced");
+    const int depth = srcDepth;
 
     // Allocate 3D array [z][y][x]
     volume.resize(depth);
@@ -1817,6 +1779,7 @@ MainWindow::VolumeData MainWindow::convertToVolume(const QVector<QImage>& images
         }
     }
 
+    // Threshold application logic: convert the active threshold into the binary volume.
     const float thresholdValue = static_cast<float>(currentThreshold * 255.0);
     auto sampleBinaryPixel = [&](const QImage& img, int x, int y) -> float {
         return (qGray(img.pixel(x, y)) >= thresholdValue) ? 1.0f : 0.0f;
@@ -1840,30 +1803,12 @@ MainWindow::VolumeData MainWindow::convertToVolume(const QVector<QImage>& images
         }
     };
 
-    if (interpolatedSparseGaps) {
-        int outZ = 0;
-        for (int srcZ = 0; srcZ + 1 < srcDepth; ++srcZ) {
-            const int stepCount = qMax(1, zStepCounts.value(srcZ, 1));
-            writeVolumeSlice(outZ++, images[srcZ], nullptr, 0.0f);
-            for (int step = 1; step < stepCount; ++step) {
-                const float lerpT = float(step) / float(stepCount);
-                writeVolumeSlice(outZ++, images[srcZ], &images[srcZ + 1], lerpT);
-            }
+    for (int z = 0; z < depth; ++z) {
+        writeVolumeSlice(z, images[z], nullptr, 0.0f);
 
-            if (progressCallback) {
-                const int progress = 5 + (outZ * 70 / qMax(1, depth));
-                progressCallback(progress, QString("Building interpolated 3D volume... %1/%2 slices").arg(outZ).arg(depth));
-            }
-        }
-        writeVolumeSlice(depth - 1, images.last(), nullptr, 0.0f);
-    } else {
-        for (int z = 0; z < depth; ++z) {
-            writeVolumeSlice(z, images[z], nullptr, 0.0f);
-
-            if (progressCallback) {
-                const int progress = 5 + ((z + 1) * 70 / depth);
-                progressCallback(progress, QString("Building 3D volume... %1/%2 slices").arg(z + 1).arg(depth));
-            }
+        if (progressCallback) {
+            const int progress = 5 + ((z + 1) * 70 / depth);
+            progressCallback(progress, QString("Building 3D volume... %1/%2 slices").arg(z + 1).arg(depth));
         }
     }
 
@@ -1889,122 +1834,8 @@ MainWindow::VolumeData MainWindow::convertToVolume(const QVector<QImage>& images
     //     volumeFile.close();
     // }
 
-    // ----------------------------------------------------------------
-    // 3-D Gaussian smoothing: converts the hard binary 0/1 volume into
-    // smooth gradients so Marching Cubes can interpolate surface positions
-    // accurately instead of producing staircase banding.
-    // ----------------------------------------------------------------
-
-    // Pass 1 – XY per-slice blur (smooths ragged mask edges within each slice)
-    if (progressCallback) {
-        progressCallback(82, "Smoothing volume (XY pass)...");
-    }
-    const double baseSigma = sparseDepth ? 0.65 : (denseDepth ? 2.3 : 1.4);
-    const double xySigma = baseSigma * smoothingIntensity;
-    const cv::Size xyKernel = sparseDepth ? cv::Size(3, 3) : (xySigma < 0.1 ? cv::Size(3, 3) : cv::Size(5, 5));
-    qDebug() << "Volume profile" << depthProfile
-             << "XY sigma" << xySigma << "(base=" << baseSigma << "intensity=" << smoothingIntensity << ")"
-             << "spacing" << voxelSpacingX << voxelSpacingY << voxelSpacingZ;
-    for (int z = 0; z < depth; ++z) {
-        cv::Mat sliceMat(height, width, CV_32F);
-        for (int y = 0; y < height; ++y)
-            std::memcpy(sliceMat.ptr<float>(y), volume[z][y].constData(), width * sizeof(float));
-        if (xySigma > 0.1) {
-            cv::GaussianBlur(sliceMat, sliceMat, xyKernel, xySigma);
-        }
-        for (int y = 0; y < height; ++y)
-            std::memcpy(volume[z][y].data(), sliceMat.ptr<float>(y), width * sizeof(float));
-    }
-
-    // Sparse stacks can have large inter-slice jumps; bridge obvious one-slice gaps
-    // while suppressing isolated one-slice speckles before Z smoothing.
-    if (sparseDepth && depth >= 3) {
-        if (progressCallback) {
-            progressCallback(85, "Smoothing volume (sparse Z consistency)...");
-        }
-        VolumeData zConsistent = volume;
-        for (int z = 1; z < depth - 1; ++z) {
-            for (int y = 0; y < height; ++y) {
-                const float* prevRow = volume[z - 1][y].constData();
-                const float* currRow = volume[z][y].constData();
-                const float* nextRow = volume[z + 1][y].constData();
-                float* outRow = zConsistent[z][y].data();
-
-                for (int x = 0; x < width; ++x) {
-                    const float prevVal = prevRow[x];
-                    const float currVal = currRow[x];
-                    const float nextVal = nextRow[x];
-
-                    const bool prevOn = (prevVal > 0.55f);
-                    const bool currOn = (currVal > 0.55f);
-                    const bool nextOn = (nextVal > 0.55f);
-
-                    if (!currOn && prevOn && nextOn) {
-                        outRow[x] = qMax(currVal, 0.72f);
-                    } else if (currOn && !prevOn && !nextOn) {
-                        outRow[x] = currVal * 0.35f;
-                    }
-                }
-            }
-        }
-        volume.swap(zConsistent);
-        qDebug() << "Sparse Z consistency bridge applied";
-    }
-
-    // Pass 2 – Z-direction 3-tap kernel [0.25, 0.5, 0.25]
-    // Uses a rolling 2-plane buffer so extra memory is O(W*H) regardless of depth.
-    if (progressCallback) {
-        progressCallback(87, "Smoothing volume (Z pass)...");
-    }
-    if (depth >= 3) {
-        const float zPrevNextW = sparseDepth ? 0.20f : 0.30f;
-        const float zCenterW = 1.0f - (2.0f * zPrevNextW);
-        // Multiple passes approximate a wider Gaussian in Z — crucial for dense stacks
-        // where a single [0.25, 0.5, 0.25] pass leaves hard per-slice steps (staircase).
-        const int zSmoothPasses = denseDepth ? 5 : (sparseDepth ? 2 : 2);
-        qDebug() << "Z smoothing passes:" << zSmoothPasses << "weights:" << zPrevNextW << zCenterW << zPrevNextW;
-
-        for (int pass = 0; pass < zSmoothPasses; ++pass) {
-            std::vector<float> prevPlane(static_cast<std::size_t>(height) * width);
-            std::vector<float> currPlane(static_cast<std::size_t>(height) * width);
-
-            // Seed with the first (boundary) slice — left unmodified.
-            for (int y = 0; y < height; ++y)
-                std::memcpy(&prevPlane[y * width], volume[0][y].constData(), width * sizeof(float));
-
-            for (int z = 1; z < depth - 1; ++z) {
-                for (int y = 0; y < height; ++y)
-                    std::memcpy(&currPlane[y * width], volume[z][y].constData(), width * sizeof(float));
-
-                for (int y = 0; y < height; ++y) {
-                    const float* prev = &prevPlane[y * width];
-                    const float* curr = &currPlane[y * width];
-                    const float* next = volume[z + 1][y].constData();
-                    float* out  = volume[z][y].data();
-                    for (int x = 0; x < width; ++x)
-                        out[x] = zPrevNextW * prev[x] + zCenterW * curr[x] + zPrevNextW * next[x];
-                }
-
-                std::swap(prevPlane, currPlane);
-            }
-        }
-    }
-
-    // Suppress weak residual streaks after smoothing, mostly for dense stacks.
-    // This keeps strong bone responses while removing faint banding layers.
-    const float lowCut = sparseDepth ? 0.06f : (denseDepth ? 0.24f : 0.18f);
-    const float highCut = sparseDepth ? 0.92f : (denseDepth ? 0.78f : 0.80f);
-    const float invRange = 1.0f / qMax(1e-6f, highCut - lowCut);
-    for (int z = 0; z < depth; ++z) {
-        for (int y = 0; y < height; ++y) {
-            float* row = volume[z][y].data();
-            for (int x = 0; x < width; ++x) {
-                const float v = (row[x] - lowCut) * invRange;
-                row[x] = qBound(0.0f, v, 1.0f);
-            }
-        }
-    }
-    qDebug() << "Post-smooth clamp:" << lowCut << "to" << highCut;
+    // Active production path intentionally disables XY/Z smoothing and inter-slice blending
+    // so the mesh input remains a strict thresholded binary field.
 
     if (progressCallback) {
         progressCallback(90, "Volume ready. Preparing GPU execution...");
@@ -2071,6 +1902,7 @@ quint16 MainWindow::computeOtsuThreshold16(const VolumeData16& volume) {
 }
 
 MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& slices16, int threshold16, float smoothingIntensity, const ProgressCallback& progressCallback) {
+    Q_UNUSED(smoothingIntensity);
     VolumeData volume;
 
     if (slices16.isEmpty()) {
@@ -2082,7 +1914,7 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
     const int srcHeight = slices16.first().rows;
     const int srcDepth = slices16.size();
 
-    qDebug() << "Converting 16-bit slices to scalar volume. Dimensions:"
+    qDebug() << "Converting 16-bit slices to binary volume. Dimensions:"
              << srcWidth << "x" << srcHeight << "x" << srcDepth;
 
     for (int i = 0; i < slices16.size(); ++i) {
@@ -2097,8 +1929,6 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
     const int depth = srcDepth;
     const bool sparseInput = (srcDepth <= 48);
     const bool denseInput = (srcDepth >= 200);
-    const bool sparseDepth = sparseInput;
-    const bool denseDepth = denseInput;
 
     volume.resize(depth);
     for (int z = 0; z < depth; ++z) {
@@ -2113,19 +1943,7 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
     }
 
     const int finalThreshold = qBound(0, threshold16, 65535);
-    bool foregroundIsDark = false;
-    if (polarityModeComboBox) {
-        const int polarityMode = polarityModeComboBox->currentIndex();
-        if (polarityMode == 1) {
-            foregroundIsDark = true;
-        } else if (polarityMode == 2) {
-            foregroundIsDark = false;
-        } else {
-            foregroundIsDark = ImageProcessor::detectForegroundPolarity(slices16);
-        }
-    } else {
-        foregroundIsDark = ImageProcessor::detectForegroundPolarity(slices16);
-    }
+    const bool foregroundIsDark = ImageProcessor::detectForegroundPolarity(slices16);
 
     QVector<int> sliceIndices(depth);
     for (int z = 0; z < depth; ++z) {
@@ -2212,21 +2030,31 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
          return;
      }
 
-     qDebug() << "Generating mesh...";
-    currentMesh = MarchingCubes::generateMeshStreaming(
+    qDebug() << "Generating mesh...";
+    currentMesh = MarchingCubes::generateMesh(
         currentVolume,
         isoLevel,
-        8,
         voxelSpacingX,
         voxelSpacingY,
         voxelSpacingZ
     );
+    if (currentMesh.vertices.isEmpty()) {
+        qDebug() << "Full-volume meshing returned empty result. Falling back to streaming.";
+        currentMesh = MarchingCubes::generateMeshStreaming(
+            currentVolume,
+            isoLevel,
+            8,
+            voxelSpacingX,
+            voxelSpacingY,
+            voxelSpacingZ
+        );
+    }
      qDebug() << "Generated mesh:"
               << currentMesh.vertices.size() << "vertices,"
               << currentMesh.indices.size() / 3 << "triangles";
 
      qDebug() << "Updating GLWidget...";
-     if (mainTabs) {
+     if (mainTabs && mainTabs->count() > 0) {
          mainTabs->setCurrentIndex(0);
      }
      glWidget->updateMesh(currentMesh.vertices, currentMesh.indices);
@@ -2330,16 +2158,21 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
 
      isGeneratingMesh = true;
      statusBar()->showMessage("Starting mesh generation...");
+    updateLoadingDialog(0, "Generating 3D mesh...");
+    loadingDialog->show();
+    QApplication::processEvents();
 
+     // Threshold selection logic: keep the active threshold aligned with the UI before meshing.
      currentThreshold16 = threshold16SpinBox ? threshold16SpinBox->value() : currentThreshold16;
+     currentThreshold = qBound(0.0, double(currentThreshold16) / 65535.0, 1.0);
 
      QFuture<void> future = QtConcurrent::run([this]() {
          const int sliceCount = loadedImages.size();
-        const float targetIso = 0.50f;
+         const float targetIso = 0.50f;
          const QString profile = (sliceCount <= 48) ? "sparse" : ((sliceCount >= 200) ? "dense" : "balanced");
          qDebug() << "Reconstruction profile:" << profile
                   << "slices:" << sliceCount
-                  << "segmentation mode:" << "16-bit"
+                  << "segmentation mode:" << (hasSegmentation16Data ? "native 16-bit slices" : "old thresholded slices")
                   << "iso:" << targetIso
                   << "spacing:" << voxelSpacingX << voxelSpacingY << voxelSpacingZ;
 
@@ -2352,26 +2185,47 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
          reportProgress(1, "Preparing volume data...");
 
          VolumeData volume;
-         if (!hasSegmentation16Data || segmentationSlices16.isEmpty()) {
-             qWarning() << "16-bit segmentation data is unavailable; cannot generate mesh.";
-             QMetaObject::invokeMethod(this, [this]() {
-                 statusBar()->showMessage("16-bit segmentation data unavailable. Reload dataset.", 4000);
-             }, Qt::QueuedConnection);
-             return;
+         if (hasSegmentation16Data && !segmentationSlices16.isEmpty() && segmentationSlices16.size() == loadedImages.size()) {
+             qDebug() << "Using native 16-bit segmentation path for mesh generation.";
+             volume = convertToVolume16(segmentationSlices16, currentThreshold16, 1.0f, reportProgress);
+         } else {
+             // Fallback path for non-16-bit stacks.
+             const QVector<QImage>* meshSource = &loadedImages;
+             if (meshSource->isEmpty()) {
+                 qWarning() << "No source images are available; cannot generate mesh.";
+                 QMetaObject::invokeMethod(this, [this]() {
+                     statusBar()->showMessage("No source images available. Reload dataset.", 4000);
+                 }, Qt::QueuedConnection);
+                 return;
+             }
+
+             qDebug() << "Using 8-bit thresholded image path for mesh generation.";
+             volume = convertToVolume(*meshSource, reportProgress);
          }
 
-         volume = convertToVolume16(segmentationSlices16, currentThreshold16, currentSmoothingIntensity, reportProgress);
-
          if (!volume.isEmpty()) {
-             reportProgress(92, "Running Marching Cubes on GPU...");
-             pendingMesh = MarchingCubes::generateMeshStreaming(
+             // Mesh generation logic: production path is a single full-volume pass first.
+             reportProgress(88, "Running Marching Cubes (full-volume GPU)...");
+             pendingMesh = MarchingCubes::generateMesh(
                  volume,
                  targetIso,
-                 8,
                  voxelSpacingX,
                  voxelSpacingY,
                  voxelSpacingZ
              );
+
+             if (pendingMesh.vertices.isEmpty()) {
+                 reportProgress(92, "Falling back to streaming GPU meshing...");
+                 pendingMesh = MarchingCubes::generateMeshStreaming(
+                     volume,
+                     targetIso,
+                     8,
+                     voxelSpacingX,
+                     voxelSpacingY,
+                     voxelSpacingZ
+                 );
+             }
+
              reportProgress(100, "Finalizing mesh...");
          }
      });
@@ -2380,6 +2234,9 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
  }
 
  void MainWindow::handleMeshGenerationStarted() {
+     if (!isGeneratingMesh) {
+         return;
+     }
      updateLoadingDialog(0, "Generating 3D mesh...");
      loadingDialog->show();
      QApplication::processEvents();
@@ -2388,10 +2245,10 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
  void MainWindow::handleMeshComputationFinished() {
      if (!pendingMesh.vertices.isEmpty()) {
         // Save threshold as good threshold for warm-start on next dataset
-        imageProcessor.saveLastGoodThreshold(lastMetrics.adaptiveThreshold);
+        imageProcessor.saveLastGoodThreshold(currentThreshold16);
         
         // Ensure the OpenGL tab is active before uploading buffers.
-        if (mainTabs) {
+        if (mainTabs && mainTabs->count() > 0) {
             mainTabs->setCurrentIndex(0);
         }
         updateLoadingDialog(95, "Uploading mesh to renderer...");
@@ -2422,7 +2279,7 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
  }
 
 void MainWindow::updateLoadingDialog(int progress, const QString& message) {
-    if (!loadingDialog) {
+    if (!loadingDialog || !isGeneratingMesh) {
         return;
     }
 
@@ -2462,18 +2319,17 @@ void MainWindow::updateLoadingDialog(int progress, const QString& message) {
 void MainWindow::syncThresholdControls() {
     threshold16SpinBox->setVisible(true);
     threshold16AutoButton->setVisible(true);
-    if (polarityModeComboBox) {
-        polarityModeComboBox->setVisible(true);
-    }
-    previewMaskButton->setVisible(true);
     thresholdLabel->setText(QString("Threshold (16-bit): %1").arg(currentThreshold16));
 }
 
+// Threshold selection logic: manual updates own the active threshold directly.
 void MainWindow::onThreshold16Changed(int value) {
     currentThreshold16 = value;
+    currentThreshold = qBound(0.0, double(value) / 65535.0, 1.0);
     thresholdLabel->setText(QString("Threshold (16-bit): %1").arg(value));
 }
 
+// Threshold selection logic: Otsu only suggests the threshold value.
 void MainWindow::onThreshold16Auto() {
     if (isOtsuRunning) {
         statusBar()->showMessage("Otsu threshold is already computing...", 2500);
@@ -2501,6 +2357,7 @@ void MainWindow::onThreshold16Auto() {
         // Warm-start available: instant feedback
         statusBar()->showMessage("Using previous good threshold as warm-start...", 1500);
         threshold16SpinBox->setValue(warmStart);
+        currentThreshold = qBound(0.0, double(warmStart) / 65535.0, 1.0);
         isOtsuRunning = false;
         if (generate3DAct) {
             generate3DAct->setEnabled(true);
@@ -2524,6 +2381,7 @@ void MainWindow::onOtsuComputationFinished() {
     const int boundedThreshold = qBound(0, suggestedThreshold, 65535);
 
     threshold16SpinBox->setValue(boundedThreshold);
+    currentThreshold = qBound(0.0, double(boundedThreshold) / 65535.0, 1.0);
     isOtsuRunning = false;
     if (generate3DAct) {
         generate3DAct->setEnabled(true);
@@ -2531,103 +2389,8 @@ void MainWindow::onOtsuComputationFinished() {
     threshold16AutoButton->setEnabled(true);
 
     statusBar()->showMessage(
-        QString("Threshold suggested: %1. Click Generate 3D to apply full adaptive processing and create mesh.")
+        QString("Threshold suggested: %1. Click Generate 3D to rebuild the old thresholded mesh path.")
             .arg(boundedThreshold),
         5000);
 }
 
-void MainWindow::onSmoothingIntensityChanged(int value) {
-    currentSmoothingIntensity = value / 100.0f;  // Convert 0-100 to 0.0-1.0
-    if (smoothingLabel) {
-        smoothingLabel->setText(QString("Smoothing: %1%").arg(value));
-    }
-    qDebug() << "Smoothing intensity changed to:" << currentSmoothingIntensity;
-}
-
-void MainWindow::onPreviewMask() {
-    if (!hasSegmentation16Data || segmentationSlices16.isEmpty()) {
-        QMessageBox::information(this,
-                                 "Preview Mask Unavailable",
-                                 "No images are loaded, so a mask preview cannot be shown.");
-        return;
-    }
-
-    const int threshold = threshold16SpinBox ? threshold16SpinBox->value() : currentThreshold16;
-    bool foregroundIsDark = detectForegroundIsDark(segmentationSlices16);
-    const int polarityMode = polarityModeComboBox ? polarityModeComboBox->currentIndex() : 0;
-    if (polarityMode == 1) {
-        foregroundIsDark = true;
-    } else if (polarityMode == 2) {
-        foregroundIsDark = false;
-    }
-    const int depth = segmentationSlices16.size();
-    const int midZ = depth / 2;
-    cv::Mat src = segmentationSlices16[midZ];
-    if (src.empty()) {
-        QMessageBox::warning(this, "Preview Mask", "Selected slice is empty.");
-        return;
-    }
-
-    cv::Mat u16;
-    if (src.type() == CV_16UC1) {
-        u16 = src;
-    } else {
-        src.convertTo(u16, CV_16UC1);
-    }
-
-    cv::Mat original8;
-    cv::normalize(u16, original8, 0, 255, cv::NORM_MINMAX, CV_8UC1);
-
-    cv::Mat binaryMask(u16.rows, u16.cols, CV_8UC1, cv::Scalar(0));
-    for (int y = 0; y < u16.rows; ++y) {
-        const quint16* row = reinterpret_cast<const quint16*>(u16.ptr(y));
-        uchar* out = binaryMask.ptr<uchar>(y);
-        for (int x = 0; x < u16.cols; ++x) {
-            const bool foreground = foregroundIsDark ? (row[x] <= threshold) : (row[x] >= threshold);
-            out[x] = foreground ? 255 : 0;
-        }
-    }
-
-    const bool sparseDepth = (depth <= 48);
-    const bool denseDepth = (depth >= 200);
-    const cv::Mat cleanedMask = cleanupBinaryMask16(binaryMask, sparseDepth, denseDepth);
-
-    QDialog previewDialog(this);
-    previewDialog.setWindowTitle("Threshold Mask Preview");
-    previewDialog.resize(1050, 420);
-
-    QVBoxLayout* rootLayout = new QVBoxLayout(&previewDialog);
-    QLabel* infoLabel = new QLabel(
-        QString("Slice %1/%2 | threshold=%3 | polarity=%4 | white pixels(before/after)=%5/%6")
-            .arg(midZ + 1)
-            .arg(depth)
-            .arg(threshold)
-            .arg(foregroundIsDark ? "<= (dark fg)" : ">= (bright fg)")
-            .arg(cv::countNonZero(binaryMask))
-            .arg(cv::countNonZero(cleanedMask)),
-        &previewDialog);
-    rootLayout->addWidget(infoLabel);
-
-    QHBoxLayout* imagesLayout = new QHBoxLayout();
-    auto makePane = [&](const QString& title, const cv::Mat& mat) {
-        QWidget* panel = new QWidget(&previewDialog);
-        QVBoxLayout* panelLayout = new QVBoxLayout(panel);
-        panelLayout->setContentsMargins(0, 0, 0, 0);
-        QLabel* titleLabel = new QLabel(title, panel);
-        QLabel* imageLabel = new QLabel(panel);
-        imageLabel->setAlignment(Qt::AlignCenter);
-        imageLabel->setStyleSheet("border: 1px solid #555;");
-        const QImage img = cvMatToQImage(mat);
-        imageLabel->setPixmap(QPixmap::fromImage(img).scaled(320, 320, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-        panelLayout->addWidget(titleLabel);
-        panelLayout->addWidget(imageLabel);
-        imagesLayout->addWidget(panel);
-    };
-
-    makePane("Original (normalized)", original8);
-    makePane("Binary mask", binaryMask);
-    makePane("Cleaned mask", cleanedMask);
-
-    rootLayout->addLayout(imagesLayout);
-    previewDialog.exec();
-}
