@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <vector>
 #include <cmath>
+#include <functional>
 
 /**
  * @brief Robust 16-bit image processing pipeline with adaptive thresholding,
@@ -25,6 +26,7 @@ class ImageProcessor : public QObject {
 
 public:
     explicit ImageProcessor(QObject* parent = nullptr);
+    using ProgressCallback = std::function<void(int, const QString&)>;
 
     /**
      * @brief Debug metrics for thresholding and segmentation quality
@@ -50,8 +52,7 @@ public:
      */
     struct AdaptiveSettings {
         double globalWeight = 0.65;          // Blend factor: global vs local (0.5-0.9)
-        double localPercentile = 0.3;        // Local thresholding percentile (0.1-0.5)
-        bool useOtsuLocal = true;            // Use Otsu for local or simple percentile
+        bool useUniformThreshold = false;    // Reuse the same threshold for every slice
         int polarityMode = 0;                // 0=auto, 1=force dark-foreground, 2=force bright-foreground
         int roiBorder = 30;                  // Border to exclude from ROI computation
         double lowOccupancyThreshold = 0.5;  // % below which we consider "too sparse"
@@ -72,7 +73,8 @@ public:
         const QVector<cv::Mat>& slices16,
         int previousGoodThreshold = 0,
         const AdaptiveSettings& settings = AdaptiveSettings(),
-        ProcessingMetrics* outMetrics = nullptr
+        ProcessingMetrics* outMetrics = nullptr,
+        const ProgressCallback& progressCallback = ProgressCallback()
     );
 
     /**
@@ -110,19 +112,17 @@ public:
     );
 
     /**
-     * @brief Compute per-slice adaptive thresholds using local Otsu + global blend
+    * @brief Compute per-slice adaptive thresholds using local Otsu + global blend
      *
      * @param slices16 Input 16-bit slices
      * @param globalThreshold Global threshold baseline
      * @param globalWeight Blend factor (0.5-0.9 recommended)
-     * @param useOtsuLocal Use Otsu (true) or percentile (false) for local step
      * @return Vector of per-slice thresholds
      */
     static QVector<int> computeAdaptiveThresholdsPerSlice(
         const QVector<cv::Mat>& slices16,
         int globalThreshold,
-        double globalWeight = 0.65,
-        bool useOtsuLocal = true
+        double globalWeight = 0.65
     );
 
     /**

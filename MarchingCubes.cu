@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <unordered_map>
 #include <cstdint>
@@ -263,7 +264,7 @@ MarchingCubes::Mesh MarchingCubes::generateMesh(
     qDebug() << "Voxel spacing:" << spacingX << "x" << spacingY << "x" << spacingZ;
 
     // Host lookup tables
-    const int edgeTable[256] = {
+    static const int edgeTable[256] = {
     0x0, 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c,
     0x80c, 0x905, 0xa0f, 0xb06, 0xc0a, 0xd03, 0xe09, 0xf00,
     0x190, 0x99, 0x393, 0x29a, 0x596, 0x49f, 0x795, 0x69c,
@@ -298,7 +299,7 @@ MarchingCubes::Mesh MarchingCubes::generateMesh(
     0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x0
     };
 
-    const int triTable[256][16] = {
+    static const int triTable[256][16] = {
         {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
         {0, 8, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
         {0, 1, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
@@ -590,11 +591,11 @@ MarchingCubes::Mesh MarchingCubes::generateMesh(
     // (a) Flatten the 3D volume to 1D array for device memory
     volumeSize = width * height * depth;
     h_volume = new float[volumeSize];
-    for (int z = 0; z < depth; z++) {
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                h_volume[z * height * width + y * width + x] = volume[z][y][x];
-            }
+    for (int z = 0; z < depth; ++z) {
+        const int zOffset = z * height * width;
+        for (int y = 0; y < height; ++y) {
+            const auto& row = volume[z][y];
+            std::memcpy(h_volume + zOffset + (y * width), row.constData(), static_cast<size_t>(width) * sizeof(float));
         }
     }
 
@@ -788,8 +789,9 @@ MarchingCubes::Mesh MarchingCubes::generateMeshStreaming(
     qDebug() << "Streaming Marching Cubes with slab depth" << effectiveSlabDepth
              << "on full volume depth" << depth;
 
-    const float seamTolerance = qMax(1e-5f, spacingZ * 0.12f);
-    const float quantizeEps = qMax(1e-5f, qMin(spacingX, qMin(spacingY, spacingZ)) * 0.005f);
+    // Stitch in voxel space to avoid per-slab floating-point scaling drift.
+    const float seamTolerance = 0.12f;
+    const float quantizeEps = 0.01f;
     std::unordered_map<QuantizedVertexKey, unsigned int, QuantizedVertexKeyHash> seamVertexMap;
 
     int zStart = 0;
@@ -812,7 +814,7 @@ MarchingCubes::Mesh MarchingCubes::generateMeshStreaming(
             slab[z] = volume[zStart + z];
         }
 
-        Mesh slabMesh = generateMesh(slab, isoLevel, spacingX, spacingY, spacingZ);
+        Mesh slabMesh = generateMesh(slab, isoLevel, 1.0f, 1.0f, 1.0f);
         if (!slabMesh.vertices.isEmpty()) {
             QVector<unsigned int> remap;
             remap.resize(slabMesh.vertices.size());
@@ -825,13 +827,13 @@ MarchingCubes::Mesh MarchingCubes::generateMeshStreaming(
                 const QVector3D globalV(
                     slabMesh.vertices[i].x(),
                     slabMesh.vertices[i].y(),
-                    slabMesh.vertices[i].z() + (static_cast<float>(zStart) * spacingZ)
+                    slabMesh.vertices[i].z() + static_cast<float>(zStart)
                 );
 
                 const QuantizedVertexKey key = quantizeVertex(globalV, quantizeEps);
                 bool reused = false;
 
-                if (zStart > 0 && qAbs(globalV.z() - (static_cast<float>(zStart) * spacingZ)) <= seamTolerance) {
+                if (zStart > 0 && qAbs(globalV.z() - static_cast<float>(zStart)) <= seamTolerance) {
                     const auto seamIt = seamVertexMap.find(key);
                     if (seamIt != seamVertexMap.end()) {
                         remap[i] = seamIt->second;
@@ -861,7 +863,7 @@ MarchingCubes::Mesh MarchingCubes::generateMeshStreaming(
 
             seamVertexMap.clear();
             seamVertexMap.reserve(localVertexMap.size() / 3 + 1024);
-            const float upperSeamZ = static_cast<float>(zEnd) * spacingZ;
+            const float upperSeamZ = static_cast<float>(zEnd);
             for (int i = 0; i < slabMesh.vertices.size(); ++i) {
                 const unsigned int mapped = remap[i];
                 if (mapped >= static_cast<unsigned int>(merged.vertices.size())) {
@@ -883,6 +885,84 @@ MarchingCubes::Mesh MarchingCubes::generateMeshStreaming(
 
         // Overlap by one slice so boundary cubes are preserved without skipping source data.
         zStart = zEnd;
+    }
+
+    // Final seam repair: streaming slabs can leave duplicated near-identical seam vertices,
+    // which creates visible horizontal cut lines after per-vertex normal generation.
+    if (!merged.vertices.isEmpty() && !merged.indices.isEmpty()) {
+        const int beforeVertices = merged.vertices.size();
+        const int beforeTriangles = merged.indices.size() / 3;
+        const float weldEps = 0.03f;
+
+        std::unordered_map<QuantizedVertexKey, unsigned int, QuantizedVertexKeyHash> weldMap;
+        weldMap.reserve(static_cast<std::size_t>(merged.vertices.size() * 1.2));
+
+        QVector<QVector3D> weldedVertices;
+        weldedVertices.reserve(merged.vertices.size());
+        QVector<unsigned int> remap;
+        remap.resize(merged.vertices.size());
+
+        for (int i = 0; i < merged.vertices.size(); ++i) {
+            const QVector3D& v = merged.vertices[i];
+            const QuantizedVertexKey key = quantizeVertex(v, weldEps);
+            const auto it = weldMap.find(key);
+            if (it != weldMap.end()) {
+                remap[i] = it->second;
+            } else {
+                const unsigned int newIndex = static_cast<unsigned int>(weldedVertices.size());
+                weldedVertices.append(v);
+                weldMap.emplace(key, newIndex);
+                remap[i] = newIndex;
+            }
+        }
+
+        QVector<unsigned int> cleanedIndices;
+        cleanedIndices.reserve(merged.indices.size());
+        const float minAreaSq = weldEps * weldEps * 0.01f;
+        for (int i = 0; i + 2 < merged.indices.size(); i += 3) {
+            const unsigned int ia = merged.indices[i];
+            const unsigned int ib = merged.indices[i + 1];
+            const unsigned int ic = merged.indices[i + 2];
+            if (ia >= static_cast<unsigned int>(remap.size())
+                || ib >= static_cast<unsigned int>(remap.size())
+                || ic >= static_cast<unsigned int>(remap.size())) {
+                continue;
+            }
+
+            const unsigned int a = remap[static_cast<int>(ia)];
+            const unsigned int b = remap[static_cast<int>(ib)];
+            const unsigned int c = remap[static_cast<int>(ic)];
+            if (a == b || b == c || a == c) {
+                continue;
+            }
+
+            const QVector3D& va = weldedVertices[static_cast<int>(a)];
+            const QVector3D& vb = weldedVertices[static_cast<int>(b)];
+            const QVector3D& vc = weldedVertices[static_cast<int>(c)];
+            const QVector3D cross = QVector3D::crossProduct(vb - va, vc - va);
+            if (cross.lengthSquared() <= minAreaSq) {
+                continue;
+            }
+
+            cleanedIndices.append(a);
+            cleanedIndices.append(b);
+            cleanedIndices.append(c);
+        }
+
+        merged.vertices.swap(weldedVertices);
+        merged.indices.swap(cleanedIndices);
+
+        qDebug() << "Streaming seam weld:" << beforeVertices << "->" << merged.vertices.size()
+                 << "vertices," << beforeTriangles << "->" << (merged.indices.size() / 3)
+                 << "triangles, eps(voxel)" << weldEps;
+    }
+
+    // Convert stitched voxel-space vertices back to physical spacing once.
+    for (int i = 0; i < merged.vertices.size(); ++i) {
+        QVector3D& v = merged.vertices[i];
+        v.setX(v.x() * spacingX);
+        v.setY(v.y() * spacingY);
+        v.setZ(v.z() * spacingZ);
     }
 
     qDebug() << "Streaming mesh complete:" << merged.vertices.size()

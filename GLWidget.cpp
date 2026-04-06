@@ -2,7 +2,10 @@
 #include <QFile>
 #include <QDebug>
 #include <QTextStream>
+#include <QCoreApplication>
+#include <QEventLoop>
 #include <QtConcurrent/QtConcurrent>
+#include <limits>
 
 
 GLWidget::GLWidget(QWidget *parent)
@@ -140,29 +143,26 @@ void GLWidget::createGeometry() {
 
 void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsigned int>& indices) {
     qDebug() << "Updating mesh with" << vertices.size() << "vertices and" << indices.size() << "indices";
+    const bool hugeMesh = (vertices.size() > 1200000 || indices.size() > 3600000);
+    const int eventStride = hugeMesh ? 1200000 : std::numeric_limits<int>::max();
 
     if (!isValid()) {
         qWarning() << "GLWidget context is not valid yet; mesh upload may be deferred until widget is shown.";
     }
 
-    // Debug: Print first 10 vertices
-    for (int i = 0; i < qMin(10, vertices.size()); ++i) {
-        qDebug() << "Vertex" << i << ":" << vertices[i];
+    // Avoid expensive per-element debug output for very large meshes.
+    if (!hugeMesh) {
+        for (int i = 0; i < qMin(10, vertices.size()); ++i) {
+            qDebug() << "Vertex" << i << ":" << vertices[i];
+        }
+        for (int i = 0; i < qMin(10, indices.size()); ++i) {
+            qDebug() << "Index" << i << ":" << indices[i];
+        }
     }
 
-    // Debug: Print first 10 indices
-    for (int i = 0; i < qMin(10, indices.size()); ++i) {
-        qDebug() << "Index" << i << ":" << indices[i];
-    }
-
-    makeCurrent();
-
-    // Delete existing buffers if they exist
-    if (vbo.isCreated()) vbo.destroy();
-    if (ibo.isCreated()) ibo.destroy();
-
-    vao.bind();
-
+    QVector<float> interleaved;
+    interleaved.resize(vertices.size() * 6);
+    float* interleavedData = interleaved.data();
     QVector<QVector3D> normals(vertices.size(), QVector3D(0.0f, 0.0f, 0.0f));
     for (int i = 0; i + 2 < indices.size(); i += 3) {
         const unsigned int ia = indices[i];
@@ -185,10 +185,19 @@ void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsi
         normals[ia] += faceNormal;
         normals[ib] += faceNormal;
         normals[ic] += faceNormal;
+
+        if (i > 0 && (i % eventStride == 0)) {
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        }
     }
 
-    QVector<float> interleaved;
-    interleaved.reserve(vertices.size() * 6);
+    QVector3D minBounds;
+    QVector3D maxBounds;
+    if (!vertices.isEmpty()) {
+        minBounds = vertices[0];
+        maxBounds = vertices[0];
+    }
+
     for (int i = 0; i < vertices.size(); ++i) {
         QVector3D n = normals[i];
         if (n.lengthSquared() <= 1e-12f) {
@@ -197,13 +206,36 @@ void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsi
             n.normalize();
         }
 
-        interleaved.append(vertices[i].x());
-        interleaved.append(vertices[i].y());
-        interleaved.append(vertices[i].z());
-        interleaved.append(n.x());
-        interleaved.append(n.y());
-        interleaved.append(n.z());
+        const QVector3D& v = vertices[i];
+        const int base = i * 6;
+        interleavedData[base + 0] = v.x();
+        interleavedData[base + 1] = v.y();
+        interleavedData[base + 2] = v.z();
+        interleavedData[base + 3] = n.x();
+        interleavedData[base + 4] = n.y();
+        interleavedData[base + 5] = n.z();
+
+        if (i > 0) {
+            minBounds.setX(qMin(minBounds.x(), v.x()));
+            minBounds.setY(qMin(minBounds.y(), v.y()));
+            minBounds.setZ(qMin(minBounds.z(), v.z()));
+            maxBounds.setX(qMax(maxBounds.x(), v.x()));
+            maxBounds.setY(qMax(maxBounds.y(), v.y()));
+            maxBounds.setZ(qMax(maxBounds.z(), v.z()));
+        }
+
+        if (i > 0 && (i % eventStride == 0)) {
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        }
     }
+
+    makeCurrent();
+
+    // Delete existing buffers if they exist
+    if (vbo.isCreated()) vbo.destroy();
+    if (ibo.isCreated()) ibo.destroy();
+
+    vao.bind();
 
     // Upload vertex data
     vbo.create();
@@ -229,14 +261,8 @@ void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsi
 
     // Calculate mesh bounds
     if (!vertices.isEmpty()) {
-        QVector3D min = vertices[0];
-        QVector3D max = vertices[0];
-        for (const QVector3D& v : vertices) {
-            min = QVector3D(qMin(min.x(), v.x()), qMin(min.y(), v.y()), qMin(min.z(), v.z()));
-            max = QVector3D(qMax(max.x(), v.x()), qMax(max.y(), v.y()), qMax(max.z(), v.z()));
-        }
-        meshSize = qMax(qMax(max.x() - min.x(), max.y() - min.y()), max.z() - min.z());
-        meshCenter = (min + max) * 0.5f;
+        meshSize = qMax(qMax(maxBounds.x() - minBounds.x(), maxBounds.y() - minBounds.y()), maxBounds.z() - minBounds.z());
+        meshCenter = (minBounds + maxBounds) * 0.5f;
 
         qDebug() << "Mesh size:" << meshSize << "Center:" << meshCenter;
     }
@@ -247,8 +273,15 @@ void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsi
         qCritical() << "OpenGL Error during buffer upload:" << err;
     }
 
-    // Always export mesh, but do file I/O in a background thread.
-    queueMeshExport(indices, vertices);
+    // Automatic mesh TXT export is useful for debugging, but copying very large meshes
+    // (for example imported multi-GB STL) can stall UI responsiveness.
+    const int autoExportVertexLimit = 150000;
+    if (vertices.size() <= autoExportVertexLimit && indices.size() <= autoExportVertexLimit * 3) {
+        queueMeshExport(indices, vertices);
+    } else {
+        qDebug() << "Skipping automatic mesh TXT export for large mesh:"
+                 << vertices.size() << "vertices," << indices.size() << "indices";
+    }
 
     doneCurrent();
     update();
@@ -368,7 +401,6 @@ void GLWidget::createTestCube() {
 }
 
 void GLWidget::keyPressEvent(QKeyEvent* event) {
-    qDebug() << "Key pressed:" << event->key(); // Debug statement
     float panSpeed = 10.0f; // Adjust panning speed as needed
 
     switch (event->key()) {

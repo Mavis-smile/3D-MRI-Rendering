@@ -126,23 +126,49 @@ cv::Mat cleanupBinaryMaskSoft(
     const bool sparseStack = (totalSlices <= 48);
     const bool denseStack = (totalSlices >= 200);
 
-    // Soften border suppression based on confidence
-    // High confidence: strict borders. Low confidence: permissive borders.
-    const double borderSuppression = 0.3 + (0.7 * confidenceLevel);  // 0.3-1.0
-    const int borderY = qMax(1, int(std::round(rows / (35.0 / borderSuppression))));
-    const int borderX = qMax(1, int(std::round(cols / (35.0 / borderSuppression))));
+    // Border suppression is now conditional: only trigger when a slab/frame artifact dominates borders.
+    const int probeY = qMax(1, rows / 24);
+    const int probeX = qMax(1, cols / 24);
+    cv::Mat borderProbe = cv::Mat::zeros(mask.size(), CV_8UC1);
+    borderProbe.rowRange(0, probeY).setTo(255);
+    borderProbe.rowRange(rows - probeY, rows).setTo(255);
+    borderProbe.colRange(0, probeX).setTo(255);
+    borderProbe.colRange(cols - probeX, cols).setTo(255);
 
-    mask.rowRange(0, borderY).setTo(0);
-    mask.rowRange(rows - borderY, rows).setTo(0);
-    mask.colRange(0, borderX).setTo(0);
-    mask.colRange(cols - borderX, cols).setTo(0);
+    cv::Mat centerProbe = cv::Mat::zeros(mask.size(), CV_8UC1);
+    const int centerX0 = cols / 4;
+    const int centerX1 = cols - centerX0;
+    const int centerY0 = rows / 4;
+    const int centerY1 = rows - centerY0;
+    centerProbe(cv::Rect(centerX0, centerY0, qMax(1, centerX1 - centerX0), qMax(1, centerY1 - centerY0))).setTo(255);
+
+    const int borderPixels = qMax(1, cv::countNonZero(borderProbe));
+    const int centerPixels = qMax(1, cv::countNonZero(centerProbe));
+    const double borderOccupancy = double(cv::countNonZero(mask & borderProbe)) / double(borderPixels);
+    const double centerOccupancy = double(cv::countNonZero(mask & centerProbe)) / double(centerPixels);
+
+    const bool borderDominantArtifact = (borderOccupancy > 0.95) && (centerOccupancy < 0.15);
+    if (borderDominantArtifact) {
+        const double borderSuppression = 0.08 + (0.20 * confidenceLevel);
+        const double borderDivisor = denseStack ? 140.0 : 100.0;
+        const int borderY = qMax(1, int(std::round(rows / (borderDivisor / borderSuppression))));
+        const int borderX = qMax(1, int(std::round(cols / (borderDivisor / borderSuppression))));
+
+        mask.rowRange(0, borderY).setTo(0);
+        mask.rowRange(rows - borderY, rows).setTo(0);
+        mask.colRange(0, borderX).setTo(0);
+        mask.colRange(cols - borderX, cols).setTo(0);
+    }
 
     // Morphology adjusted by stack profile
+    // Dense stacks should avoid open/close because they erase trabecular texture.
     const cv::Mat kernelSmall = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    if (!sparseStack) {
+    if (!sparseStack && !denseStack) {
         cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernelSmall);
     }
-    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernelSmall);
+    if (!denseStack) {
+        cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernelSmall);
+    }
 
     // Connected components with soft thresholding
     cv::Mat labels;
@@ -163,7 +189,7 @@ cv::Mat cleanupBinaryMaskSoft(
     const double minAreaFactor = 0.5 + (0.5 * confidenceLevel);  // 0.5-1.0
     const int minComponentArea = sparseStack
         ? qMax(8, int(totalPixels / (25000.0 / minAreaFactor)))
-        : (denseStack ? qMax(150, int(totalPixels / (2200.0 / minAreaFactor)))
+        : (denseStack ? qMax(8, int(totalPixels / (22000.0 / minAreaFactor)))
                       : qMax(60, int(totalPixels / (4000.0 / minAreaFactor))));
 
     QVector<Candidate> candidates;
@@ -188,9 +214,59 @@ cv::Mat cleanupBinaryMaskSoft(
         const bool touchesBottom = (top + compHeight >= rows - 1);
         const int borderTouchCount = int(touchesLeft) + int(touchesRight) + int(touchesTop) + int(touchesBottom);
 
-        // More permissive border touching when confidence is low
-        const int borderThreshold = int(std::round(3.0 - (confidenceLevel * 1.5)));  // 1-3
-        if (borderTouchCount >= borderThreshold && area > (totalPixels / 12)) {
+        const double bboxArea = double(qMax(1, compWidth * compHeight));
+        const double bboxFillRatio = double(area) / bboxArea;
+        const bool nearFullFrame = (compWidth >= (cols * 99 / 100)) && (compHeight >= (rows * 99 / 100));
+        const bool frameLike = nearFullFrame && (bboxFillRatio < 0.35);
+
+        if (frameLike) {
+            continue;
+        }
+
+        // Reject scanner-strip artifacts: thin/elongated components anchored near borders.
+        const bool thinVerticalStrip = (compHeight >= (rows * 55 / 100))
+            && (compWidth <= qMax(2, cols / 45))
+            && (double(compHeight) / double(qMax(1, compWidth)) >= 7.0);
+        const bool thinHorizontalStrip = (compWidth >= (cols * 55 / 100))
+            && (compHeight <= qMax(2, rows / 45))
+            && (double(compWidth) / double(qMax(1, compHeight)) >= 7.0);
+
+        // Moderate-width border slabs can still appear in some stacks; catch them too.
+        const bool borderLocalVerticalSlab = (compHeight >= (rows * 45 / 100))
+            && (compWidth <= qMax(4, cols / 14))
+            && (double(compHeight) / double(qMax(1, compWidth)) >= 3.0)
+            && (area <= qMax(1, totalPixels / 5));
+        const bool borderLocalHorizontalSlab = (compWidth >= (cols * 45 / 100))
+            && (compHeight <= qMax(4, rows / 14))
+            && (double(compWidth) / double(qMax(1, compHeight)) >= 3.0)
+            && (area <= qMax(1, totalPixels / 5));
+
+        const bool nearLeftOrRight = (left <= cols / 12) || (left + compWidth >= cols - (cols / 12));
+        const bool nearTopOrBottom = (top <= rows / 12) || (top + compHeight >= rows - (rows / 12));
+
+        const bool rejectVerticalStrip = nearLeftOrRight && (thinVerticalStrip || borderLocalVerticalSlab);
+        const bool rejectHorizontalStrip = nearTopOrBottom && (thinHorizontalStrip || borderLocalHorizontalSlab);
+        if (rejectVerticalStrip || rejectHorizontalStrip) {
+            static int stripRejectLogCount = 0;
+            if (stripRejectLogCount < 24) {
+                ++stripRejectLogCount;
+                qDebug() << "Rejected border strip component"
+                         << "label" << label
+                         << "bbox" << left << top << compWidth << compHeight
+                         << "area" << area
+                         << "rows/cols" << rows << cols
+                         << "vert?" << rejectVerticalStrip
+                         << "horiz?" << rejectHorizontalStrip;
+            }
+            continue;
+        }
+
+        // Reject only extreme border-dominant thin structures, not compact anatomy touching borders.
+        const int borderAreaGate = denseStack ? qMax(1, totalPixels / 2) : qMax(1, totalPixels / 8);
+        const bool extremeBorderComponent = (borderTouchCount >= 4)
+            && (area > borderAreaGate)
+            && (bboxFillRatio < 0.25);
+        if (extremeBorderComponent) {
             continue;
         }
 
@@ -210,7 +286,7 @@ cv::Mat cleanupBinaryMaskSoft(
         // Keep more components when confidence is low
         double keepCountFactor = 0.5 + (1.5 * confidenceLevel);  // 0.5-2.0
         int targetKeepCount = sparseStack ? qMax(2, int(4 * keepCountFactor))
-                                          : (denseStack ? 1 : qMax(1, int(2 * keepCountFactor)));
+                  : (denseStack ? qMax(16, int(26 * keepCountFactor)) : qMax(1, int(2 * keepCountFactor)));
         const int keepCount = qMin(targetKeepCount, candidates.size());
 
         for (int i = 0; i < keepCount; ++i) {
@@ -229,11 +305,13 @@ cv::Mat cleanupBinaryMaskSoft(
         filteredMask.setTo(255, labels == maxLabel);
     }
 
-    // Closing with size adjusted by stack profile
-    const cv::Size closeSize = sparseStack ? cv::Size(11, 5) : (denseStack ? cv::Size(19, 9) : cv::Size(13, 7));
-    const cv::Mat kernelClose = cv::getStructuringElement(cv::MORPH_ELLIPSE, closeSize);
-    cv::morphologyEx(filteredMask, filteredMask, cv::MORPH_CLOSE, kernelClose);
-    cv::morphologyEx(filteredMask, filteredMask, cv::MORPH_OPEN, kernelSmall);
+    // Final morphology: keep dense stacks untouched to preserve pores and fine internal details.
+    if (!denseStack) {
+        const cv::Size closeSize = sparseStack ? cv::Size(11, 5) : cv::Size(13, 7);
+        const cv::Mat kernelClose = cv::getStructuringElement(cv::MORPH_ELLIPSE, closeSize);
+        cv::morphologyEx(filteredMask, filteredMask, cv::MORPH_CLOSE, kernelClose);
+        cv::morphologyEx(filteredMask, filteredMask, cv::MORPH_OPEN, kernelSmall);
+    }
 
     return filteredMask;
 }
@@ -389,8 +467,7 @@ int ImageProcessor::suggestThresholdQuick(
 QVector<int> ImageProcessor::computeAdaptiveThresholdsPerSlice(
     const QVector<cv::Mat>& slices16,
     int globalThreshold,
-    double globalWeight,
-    bool useOtsuLocal
+    double globalWeight
 ) {
     QVector<int> thresholds;
     thresholds.reserve(slices16.size());
@@ -403,16 +480,7 @@ QVector<int> ImageProcessor::computeAdaptiveThresholdsPerSlice(
             continue;
         }
 
-        int localThreshold = globalThreshold;
-        if (useOtsuLocal) {
-            localThreshold = otsuSliceLocal(slice, 30);
-        } else {
-            // Use percentile method
-            auto hist = computeHistogram16(slice, 30, 30, slice.cols - 30, slice.rows - 30);
-            qint64 total = 0;
-            for (qint64 v : hist) total += v;
-            localThreshold = histogramPercentile(hist, total, 0.3);
-        }
+        const int localThreshold = otsuSliceLocal(slice, 30);
 
         // Blend: favor global (more stable) but allow local to influence
         const double localWeight = 1.0 - globalWeight;
@@ -545,7 +613,8 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
     const QVector<cv::Mat>& slices16,
     int previousGoodThreshold,
     const AdaptiveSettings& settings,
-    ProcessingMetrics* outMetrics
+    ProcessingMetrics* outMetrics,
+    const ProgressCallback& progressCallback
 ) {
     QVector<cv::Mat> resultMasks;
 
@@ -555,6 +624,13 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
     }
 
     qDebug() << "=== 16-bit Adaptive Processing Started ===";
+
+    auto reportProgress = [&](int value, const QString& message) {
+        if (progressCallback) {
+            progressCallback(qBound(0, value, 100), message);
+        }
+    };
+    reportProgress(2, "Analyzing 16-bit stack statistics...");
 
     // ===== Step 1: Polarity Detection (locked for entire volume) =====
     bool foregroundIsDark = detectForegroundPolarity(slices16);
@@ -568,24 +644,43 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
     }
     qDebug() << "Polarity mode:" << polaritySource
              << "->" << (foregroundIsDark ? "dark-foreground" : "bright-foreground");
+    reportProgress(8, "Computing adaptive thresholds...");
 
-    // ===== Step 2: Global Threshold (with warm-start) =====
-    int globalThreshold = previousGoodThreshold;
-    if (globalThreshold == 0) {
-        // Compute fresh Otsu
-        globalThreshold = computeOtsuThreshold16(slices16, 0.1);
-        qDebug() << "Computed global Otsu threshold:" << globalThreshold;
+    // ===== Step 2: Global Threshold (warm-start guarded by fresh Otsu) =====
+    const int otsuThreshold = computeOtsuThreshold16(slices16, 0.1);
+    int globalThreshold = otsuThreshold;
+    if (previousGoodThreshold > 0) {
+        const int diff = qAbs(previousGoodThreshold - otsuThreshold);
+        if (diff <= 2048) {
+            globalThreshold = previousGoodThreshold;
+            qDebug() << "Warm-start accepted:" << previousGoodThreshold
+                     << "(close to Otsu" << otsuThreshold << ")";
+        } else {
+            // Blend toward current data to avoid stale-threshold lock-in across different datasets.
+            globalThreshold = int(std::llround(0.80 * double(otsuThreshold) + 0.20 * double(previousGoodThreshold)));
+            qDebug() << "Warm-start differs from Otsu by" << diff
+                     << "-> blended threshold:" << globalThreshold
+                     << "(warm" << previousGoodThreshold << ", otsu" << otsuThreshold << ")";
+        }
     } else {
-        qDebug() << "Using warm-start threshold:" << globalThreshold;
+        qDebug() << "Using fresh Otsu threshold:" << otsuThreshold;
     }
 
     // ===== Step 3: Adaptive Per-Slice Thresholds =====
-    QVector<int> adaptiveThresholds = computeAdaptiveThresholdsPerSlice(
-        slices16,
-        globalThreshold,
-        settings.globalWeight,
-        settings.useOtsuLocal
-    );
+    QVector<int> adaptiveThresholds;
+    if (settings.useUniformThreshold) {
+        adaptiveThresholds.reserve(slices16.size());
+        for (int i = 0; i < slices16.size(); ++i) {
+            adaptiveThresholds.append(globalThreshold);
+        }
+        qDebug() << "Uniform threshold mode enabled; reusing one threshold for all slices:" << globalThreshold;
+    } else {
+        adaptiveThresholds = computeAdaptiveThresholdsPerSlice(
+            slices16,
+            globalThreshold,
+            settings.globalWeight
+        );
+    }
 
     // ===== Step 4: Apply Thresholding with Locked Polarity =====
     qint64 totalFilledVoxels = 0;
@@ -596,6 +691,7 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
 
     const int sliceCount = slices16.size();
 
+    reportProgress(14, "Thresholding and cleaning slices...");
     for (int z = 0; z < sliceCount; ++z) {
         const cv::Mat& slice16 = slices16[z];
         if (slice16.empty()) {
@@ -613,16 +709,10 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
         const int threshold = adaptiveThresholds[z];
         const quint16 threshVal = static_cast<quint16>(qBound(0, threshold, 65535));
 
-        // Binary thresholding with locked polarity
-        cv::Mat mask(u16.rows, u16.cols, CV_8UC1, cv::Scalar(0));
-        for (int y = 0; y < u16.rows; ++y) {
-            const quint16* srcRow = u16.ptr<quint16>(y);
-            uchar* maskRow = mask.ptr<uchar>(y);
-            for (int x = 0; x < u16.cols; ++x) {
-                const bool foreground = foregroundIsDark ? (srcRow[x] <= threshVal) : (srcRow[x] >= threshVal);
-                maskRow[x] = foreground ? 255 : 0;
-            }
-        }
+        // Vectorized thresholding is significantly faster than manual per-pixel loops.
+        cv::Mat mask;
+        cv::compare(u16, cv::Scalar::all(threshVal), mask,
+                    foregroundIsDark ? cv::CMP_LE : cv::CMP_GE);
 
         // Soft cleanup with confidence adjustment
         const double sliceOccupancy = double(cv::countNonZero(mask)) / double(mask.rows * mask.cols);
@@ -637,15 +727,20 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
 
         cv::Mat cleaned = softCleanupMask16(mask, z, sliceCount, confidence);
 
-        // Count components in cleaned mask
-        cv::Mat labels, stats, centroids;
-        int componentCount = cv::connectedComponentsWithStats(cleaned, labels, stats, centroids, 8, CV_32S);
-        totalKeptComponents += qMax(0, componentCount - 1);
+        totalKeptComponents += (cv::countNonZero(cleaned) > 0) ? 1 : 0;
 
         totalFilledVoxels += cv::countNonZero(cleaned);
         totalVoxels += cleaned.rows * cleaned.cols;
 
         resultMasks.append(cleaned);
+
+        if ((z % 8) == 0 || z + 1 == sliceCount) {
+            const int pct = 14 + (((z + 1) * 52) / qMax(1, sliceCount));
+            reportProgress(pct, QString("Adaptive segmentation %1/%2 slices")
+                                 .arg(z + 1)
+                                 .arg(sliceCount));
+        }
+
     }
 
     const double occupancy = (totalVoxels > 0) ? (100.0 * double(totalFilledVoxels) / double(totalVoxels)) : 0.0;
@@ -658,13 +753,15 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
     double effectiveLowBound = settings.lowOccupancyThreshold;
     double effectiveHighBound = settings.highOccupancyThreshold;
     
-    if (settings.preserveGrayscale) {
+    if (settings.preserveGrayscale && settings.highOccupancyThreshold > 90.0) {
         // For grayscale objects, relax the bounds to avoid aggressive pruning
         effectiveLowBound = qMax(0.1, settings.lowOccupancyThreshold * 0.5);  // Allow sparser structures
         effectiveHighBound = qMin(99.9, settings.highOccupancyThreshold * 1.2); // Allow denser structures
         qDebug() << "Grayscale preservation enabled: relaxed occupancy bounds to [" 
                  << effectiveLowBound << "%, " << effectiveHighBound << "%]";
     }
+
+    reportProgress(68, "Validating occupancy and continuity...");
 
     if (checkOccupancyAndSuggestCorrection(
             resultMasks,
@@ -682,12 +779,19 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
             autoAdjustmentRatio = double(finalThreshold) / double(qMax(1, globalThreshold));
 
             // Recompute per-slice thresholds with adjusted global
-            adaptiveThresholds = computeAdaptiveThresholdsPerSlice(
-                slices16,
-                finalThreshold,
-                settings.globalWeight,
-                settings.useOtsuLocal
-            );
+            if (settings.useUniformThreshold) {
+                adaptiveThresholds.clear();
+                adaptiveThresholds.reserve(slices16.size());
+                for (int i = 0; i < slices16.size(); ++i) {
+                    adaptiveThresholds.append(finalThreshold);
+                }
+            } else {
+                adaptiveThresholds = computeAdaptiveThresholdsPerSlice(
+                    slices16,
+                    finalThreshold,
+                    settings.globalWeight
+                );
+            }
 
             // Re-threshold all slices with new thresholds
             resultMasks.clear();
@@ -697,6 +801,7 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
             slicesTooDense = 0;
             totalKeptComponents = 0;
 
+            reportProgress(72, "Applying one-pass safety correction...");
             for (int z = 0; z < sliceCount; ++z) {
                 const cv::Mat& slice16 = slices16[z];
                 if (slice16.empty()) {
@@ -714,15 +819,9 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
                 const int threshold = adaptiveThresholds[z];
                 const quint16 threshVal = static_cast<quint16>(qBound(0, threshold, 65535));
 
-                cv::Mat mask(u16.rows, u16.cols, CV_8UC1, cv::Scalar(0));
-                for (int y = 0; y < u16.rows; ++y) {
-                    const quint16* srcRow = u16.ptr<quint16>(y);
-                    uchar* maskRow = mask.ptr<uchar>(y);
-                    for (int x = 0; x < u16.cols; ++x) {
-                        const bool foreground = foregroundIsDark ? (srcRow[x] <= threshVal) : (srcRow[x] >= threshVal);
-                        maskRow[x] = foreground ? 255 : 0;
-                    }
-                }
+                cv::Mat mask;
+                cv::compare(u16, cv::Scalar::all(threshVal), mask,
+                            foregroundIsDark ? cv::CMP_LE : cv::CMP_GE);
 
                 const double sliceOccupancy = double(cv::countNonZero(mask)) / double(mask.rows * mask.cols);
                 double confidence = 0.8;
@@ -736,14 +835,20 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
 
                 cv::Mat cleaned = softCleanupMask16(mask, z, sliceCount, confidence);
 
-                cv::Mat labels, stats, centroids;
-                int componentCount = cv::connectedComponentsWithStats(cleaned, labels, stats, centroids, 8, CV_32S);
-                totalKeptComponents += qMax(0, componentCount - 1);
+                totalKeptComponents += (cv::countNonZero(cleaned) > 0) ? 1 : 0;
 
                 totalFilledVoxels += cv::countNonZero(cleaned);
                 totalVoxels += cleaned.rows * cleaned.cols;
 
                 resultMasks.append(cleaned);
+
+                if ((z % 10) == 0 || z + 1 == sliceCount) {
+                    const int pct = 72 + (((z + 1) * 24) / qMax(1, sliceCount));
+                    reportProgress(pct, QString("Safety-corrected segmentation %1/%2 slices")
+                                         .arg(z + 1)
+                                         .arg(sliceCount));
+                }
+
             }
 
             qDebug() << "Safety correction applied. New threshold:" << finalThreshold
@@ -769,6 +874,8 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
         outMetrics->perSliceThresholds = adaptiveThresholds;
         outMetrics->safetyCorectionApplied = (finalThreshold != globalThreshold);
     }
+
+    reportProgress(100, "Adaptive segmentation complete.");
 
     // Detailed diagnostic logging
     qDebug() << "\n=== 16-BIT ADAPTIVE PROCESSING COMPLETE ===";

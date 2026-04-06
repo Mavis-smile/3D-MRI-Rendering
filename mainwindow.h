@@ -33,6 +33,7 @@
 #include <QMessageBox>
 #include <QProgressDialog>
 #include <QFutureWatcher>
+#include <QPointer>
 #include <QSpinBox>
 #include <QtConcurrent/QtConcurrent>
 #include <functional>
@@ -62,6 +63,8 @@ private slots:
     void handleMeshGenerationStarted();
     void handleMeshComputationFinished();
     void handleMeshRenderingFinished();
+    void appendPreviewThumbnails();
+    void finalizeImportUi();
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -90,6 +93,11 @@ private:
     QScrollArea* previewScroll;
     QWidget* previewContainer;
     QGridLayout* previewLayout;
+    QVector<QImage> previewBuildImages;
+    int previewBuildIndex = 0;
+    bool previewBuildInProgress = false;
+    QTimer previewBuildTimer;
+    QPointer<QProgressDialog> activeImportDialog;
     // void createDockPanels();
     void loadImages(const QStringList& filePaths);
     // QImage loadImage(const QString& path);  // Add this line
@@ -128,6 +136,7 @@ private:
     QFutureWatcher<int> otsuWatcher;
     bool isGeneratingMesh = false;
     bool isOtsuRunning = false;
+    bool isExportingStl = false;
     MarchingCubes::Mesh pendingMesh; // Store mesh while waiting for OpenGL
 
     // Default physical voxel spacing used for geometry scaling.
