@@ -2222,6 +2222,7 @@ void MainWindow::openDataset() {
 }
 
 void MainWindow::loadImages(const QStringList& filePaths) {
+    importTimer.start();
     currentImagePaths = filePaths;
     syncThresholdControls();
 
@@ -2318,13 +2319,17 @@ void MainWindow::loadImages(const QStringList& filePaths) {
                         .arg(loadedImages.size()).arg(result.failedCount).arg(result.native16Count).arg(segmentationSlices16.size()).arg(currentThreshold16)
                     : QString("Images loaded successfully (%1 slices). Seg16 native: %2/%3. Threshold remains %4.")
                         .arg(loadedImages.size()).arg(result.native16Count).arg(segmentationSlices16.size()).arg(currentThreshold16);
-                statusBar()->showMessage(msg, 5000);
+                qDebug().noquote() << "-------";
+                qDebug().noquote() << QString("Import dataset: %1 s").arg(double(importTimer.elapsed()) / 1000.0, 0, 'f', 2);
+                qDebug().noquote() << msg;
+                qDebug().noquote() << "-------";
                 updateImagePreviews();
             } else {
-                statusBar()->showMessage(
-                    QString("No valid images loaded (%1 file(s) failed to decode). "
-                            "Compressed DICOM (JPEG/JPEG2000) is not supported.").arg(result.failedCount),
-                    8000);
+                qDebug().noquote() << "-------";
+                qDebug().noquote() << QString("Import dataset: %1 s").arg(double(importTimer.elapsed()) / 1000.0, 0, 'f', 2);
+                qDebug().noquote() << QString("No valid images loaded (%1 file(s) failed to decode). "
+                            "Compressed DICOM (JPEG/JPEG2000) is not supported.").arg(result.failedCount);
+                qDebug().noquote() << "-------";
                 updateImagePreviews();
             }
         });
@@ -3774,6 +3779,8 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
      }
      qDebug() << "[STL Export] Target path:" << fileName;
 
+    stlTimer.start();
+
      isExportingStl = true;
      if (generate3DAct) generate3DAct->setEnabled(false);
      if (exportSTLAct) exportSTLAct->setEnabled(false);
@@ -3815,6 +3822,8 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
              return;
          }
 
+         qDebug().noquote() << "-------";
+         qDebug().noquote() << QString("Export STL: %1 s").arg(double(stlTimer.elapsed()) / 1000.0, 0, 'f', 2);
          qDebug() << "[STL Export] Success | triangles:" << result.writtenTriangles
                   << "bytes:" << result.bytesOnDisk;
          if (result.skippedInvalidTriangles > 0) {
@@ -3823,9 +3832,8 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
          if (result.skippedDegenerateTriangles > 0) {
              qWarning() << "[STL Export] Skipped" << result.skippedDegenerateTriangles << "degenerate triangle(s).";
          }
-         statusBar()->showMessage(QString("STL exported successfully (%1 triangles).")
-                                      .arg(result.writtenTriangles),
-                                  4000);
+         qDebug() << "[STL Export] Completed with" << result.writtenTriangles << "triangle(s).";
+         qDebug().noquote() << "-------";
      });
 
      QPointer<MainWindow> weakWindow(this);
@@ -3875,6 +3883,8 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
     loadingDialog->show();
     centerDialogOnWidget(loadingDialog, this);
     QApplication::processEvents();
+
+    meshTimer.start();
 
      // Threshold selection logic: keep the active threshold aligned with the UI before meshing.
      currentThreshold16 = threshold16SpinBox ? threshold16SpinBox->value() : currentThreshold16;
@@ -3969,6 +3979,8 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
         updateLoadingDialog(92, "Uploading mesh to renderer...");
         currentMesh = pendingMesh; // Update currentMesh for export
         glWidget->updateMesh(currentMesh.vertices, currentMesh.indices);
+        qDebug().noquote() << "-------";
+        qDebug().noquote() << QString("Generate 3D: %1 s").arg(double(meshTimer.elapsed()) / 1000.0, 0, 'f', 2);
      } else {
          handleMeshRenderingFinished();
      }
@@ -4108,6 +4120,8 @@ void MainWindow::updateLoadingDialog(int progress, const QString& message) {
      });
      setEnabled(false);
 
+    meshLoadTimer.start();
+
      auto* watcher = new QFutureWatcher<LoadedMeshResult>(this);
      connect(watcher, &QFutureWatcher<LoadedMeshResult>::finished, this,
              [this, watcher, progressDialog]() {
@@ -4147,12 +4161,15 @@ void MainWindow::updateLoadingDialog(int progress, const QString& message) {
                  uploadDialog->deleteLater();
              }
              setEnabled(true);
+             qDebug().noquote() << "-------";
+             qDebug().noquote() << QString("Load mesh: %1 s").arg(double(meshLoadTimer.elapsed()) / 1000.0, 0, 'f', 2);
              statusBar()->showMessage(
                  QString("Loaded mesh (%1 vertices, %2 triangles)")
                      .arg(currentMesh.vertices.size())
                      .arg(currentMesh.indices.size() / 3),
                  5000
              );
+             qDebug().noquote() << "-------";
              watcher->deleteLater();
          });
 

@@ -27,6 +27,7 @@
 #include "ImageProcessor.h"
 #include <opencv2/opencv.hpp>
 #include <QTimer>
+#include <QElapsedTimer>
 #include <QTabWidget>
 #include <QScrollArea>
 #include <QGridLayout>
@@ -119,6 +120,10 @@ private:
     QSlider *isoSlider; // Add this line
     QSlider *threshSlider; // Add this line
     QElapsedTimer isoChangeTimer;
+    QElapsedTimer importTimer;
+    QElapsedTimer meshTimer;
+    QElapsedTimer stlTimer;
+    QElapsedTimer meshLoadTimer;
     QVector<QImage> loadedImages; // Store loaded images
     QVector<cv::Mat> segmentationSlices16; // Reserved for 16-bit segmentation path.
     QAction* exportSTLAct;

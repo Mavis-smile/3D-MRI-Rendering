@@ -1,6 +1,7 @@
 #include "MarchingCubes.h"
 #include <QtMath>
 #include <QDebug>
+#include <QElapsedTimer>
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +11,55 @@
 #include <cstdint>
 
 namespace {
+    void logCudaDeviceSummaryOnce()
+    {
+        static bool logged = false;
+        if (logged) {
+            return;
+        }
+        logged = true;
+
+        int deviceId = -1;
+        const cudaError_t deviceStatus = cudaGetDevice(&deviceId);
+        if (deviceStatus != cudaSuccess) {
+            qWarning() << "CUDA device query failed:" << cudaGetErrorString(deviceStatus);
+            return;
+        }
+
+        cudaDeviceProp props{};
+        const cudaError_t propStatus = cudaGetDeviceProperties(&props, deviceId);
+        if (propStatus != cudaSuccess) {
+            qWarning() << "CUDA device property query failed:" << cudaGetErrorString(propStatus);
+            return;
+        }
+
+        size_t freeMem = 0;
+        size_t totalMem = 0;
+        const cudaError_t memStatus = cudaMemGetInfo(&freeMem, &totalMem);
+
+        qDebug().noquote() << "-------";
+        qDebug().noquote() << QString("GPU marching cubes device: %1 (%2)")
+                                  .arg(props.name)
+                                  .arg(deviceId);
+        qDebug().noquote() << QString("Compute capability: %1.%2 | SMs: %3 | Warp: %4 | Shared memory/block: %5 KB")
+                                  .arg(props.major)
+                                  .arg(props.minor)
+                                  .arg(props.multiProcessorCount)
+                                  .arg(props.warpSize)
+                                  .arg(props.sharedMemPerBlock / 1024);
+        qDebug().noquote() << QString("Global memory: %1 MB total, %2 MB free")
+                                  .arg(static_cast<double>(totalMem) / (1024.0 * 1024.0), 0, 'f', 2)
+                                  .arg(static_cast<double>(freeMem) / (1024.0 * 1024.0), 0, 'f', 2);
+        qDebug().noquote() << QString("Kernel support: concurrent kernels=%1, integrated=%2, unified addressing=%3")
+                                  .arg(props.concurrentKernels ? "yes" : "no")
+                                  .arg(props.integrated ? "yes" : "no")
+                                  .arg(props.unifiedAddressing ? "yes" : "no");
+        if (memStatus != cudaSuccess) {
+            qWarning() << "CUDA memory telemetry unavailable:" << cudaGetErrorString(memStatus);
+        }
+        qDebug().noquote() << "-------";
+    }
+
     bool checkCuda(cudaError_t err, const char* operation)
         {
             if (err == cudaSuccess) {
@@ -241,6 +291,8 @@ MarchingCubes::Mesh MarchingCubes::generateMesh(
     ) {
 
     qDebug() << "Entering generateMesh";
+
+    logCudaDeviceSummaryOnce();
 
     Mesh mesh;
     if (volume.isEmpty()) {
@@ -576,6 +628,7 @@ MarchingCubes::Mesh MarchingCubes::generateMesh(
     size_t vertexBytes = 0;
     dim3 threads(8, 8, 8);
     dim3 blocks(1, 1, 1);
+    QElapsedTimer gpuTimer;
     int h_triangleCount = 0;
     int copyVertexCount = 0;
     int triangleAlignedCount = 0;
@@ -662,6 +715,8 @@ MarchingCubes::Mesh MarchingCubes::generateMesh(
              << "grid:" << blocks.x << "x" << blocks.y << "x" << blocks.z
              << "blocks:" << threads.x << "x" << threads.y << "x" << threads.z;
 
+    gpuTimer.start();
+
     // (e) Launch marchingCubesKernel with GPU-only execution
     marchingCubesKernel<<<blocks, threads>>>(
         d_volume,
@@ -742,6 +797,9 @@ MarchingCubes::Mesh MarchingCubes::generateMesh(
     qDebug() << "Generated mesh:"
              << mesh.vertices.size() << "vertices,"
              << mesh.indices.size() / 3 << "triangles";
+    qDebug().noquote() << QString("GPU marching cubes compute time: %1 s")
+                              .arg(double(gpuTimer.elapsed()) / 1000.0, 0, 'f', 2);
+    qDebug().noquote() << "-------";
 
 cleanup:
     delete[] h_volume;
