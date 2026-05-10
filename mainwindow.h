@@ -23,6 +23,9 @@
 #include <QThread>
 #include <QVector3D>
 #include <QAction>
+#include <QCheckBox>       // Add this for material colors
+#include <QSpinBox>        // Add this for material thresholds
+#include <QPushButton>     // Add this for color pickers
 #include "MarchingCubes.h"
 #include "ImageProcessor.h"
 #include <opencv2/opencv.hpp>
@@ -74,17 +77,19 @@ protected:
 private:
     using ProgressCallback = std::function<void(int, const QString&)>;
     void saveProcessedImage(const QImage& image, const QString& filePath);
+    void finalizeMeshProgressDialog();
     void createMenu();
     void createToolbar();
     void createCentralWidget();
     void createPreviewTab();
+    void addMaterialVisualizationControls();
     void showFullSizeImage(const QImage& image);
     void updateImagePreviews();
     void loadMesh();
     void syncThresholdControls();
-    QSpinBox* threshold16SpinBox;
-    QPushButton* threshold16AutoButton;
-    QLabel* thresholdLabel;
+    QSpinBox* threshold16SpinBox = nullptr;
+    QPushButton* threshold16AutoButton = nullptr;
+    QLabel* thresholdLabel = nullptr;
     QAction* generate3DAct;
     double currentThreshold = 0.43;
     static constexpr int kDefaultThreshold16 = 28180;
@@ -110,7 +115,7 @@ private:
     using VolumeData16 = QVector<QVector<QVector<quint16>>>;
     // Declare the function
     VolumeData convertToVolume(const QVector<QImage>& images, const ProgressCallback& progressCallback = ProgressCallback());
-    VolumeData convertToVolume16(const QVector<cv::Mat>& slices16, int threshold16, float smoothingIntensity = 1.0f, const ProgressCallback& progressCallback = ProgressCallback());
+    VolumeData convertToVolume16(const QVector<cv::Mat>& slices16, int previousGoodThreshold = 0, float smoothingIntensity = 1.0f, const ProgressCallback& progressCallback = ProgressCallback());
     static quint16 computeOtsuThreshold16(const VolumeData16& volume);
     void updateLoadingDialog(int progress, const QString& message);
     void generateMesh();
@@ -128,6 +133,7 @@ private:
     QVector<cv::Mat> segmentationSlices16; // Reserved for 16-bit segmentation path.
     QAction* exportSTLAct;
     GLWidget* glWidget;
+    QToolBar* toolBar = nullptr;  // Main toolbar for actions and controls
     QDockWidget* controlsDock;
     QProgressBar *progressBar;
     QLabel* imageLabel;
@@ -140,6 +146,7 @@ private:
     QFutureWatcher<void> meshGenerationWatcher;
     QFutureWatcher<int> otsuWatcher;
     bool isGeneratingMesh = false;
+    bool waitingForMeshUploadCompletion = false;
     bool isOtsuRunning = false;
     bool isExportingStl = false;
     MarchingCubes::Mesh pendingMesh; // Store mesh while waiting for OpenGL
@@ -154,6 +161,18 @@ private:
     ImageProcessor imageProcessor;
     ImageProcessor::ProcessingMetrics lastMetrics;
 
+    // Material visualization and segmentation
+    bool materialColorsEnabled = false;
+    // UI Controls for material visualization
+    QCheckBox* materialColorsCheckBox = nullptr;
+
+
+    // Material segmentation methods
+    VolumeData16 buildRawVolume16(const QVector<cv::Mat>& slices16) const;
+    void estimateMaterialThresholds(const VolumeData16& volume16, int& ceramicThreshold16, int& boneThreshold16) const;
+    MarchingCubes::Mesh classifyMeshByMaterial(const MarchingCubes::Mesh& inputMesh,
+                                                const VolumeData16& volume16);
+    void onMaterialColorsToggled(bool enabled);
 
 };
 #endif // MAINWINDOW_H

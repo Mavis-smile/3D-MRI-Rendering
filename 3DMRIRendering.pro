@@ -4,6 +4,17 @@ greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 CONFIG += c++17
 
+# OpenMesh requires _USE_MATH_DEFINES on Windows MSVC
+DEFINES += _USE_MATH_DEFINES
+
+OPENMESH_DIR = $$(OPENMESH_DIR)
+!isEmpty(OPENMESH_DIR) {
+    INCLUDEPATH += $$OPENMESH_DIR/include
+    LIBS += -L"$$OPENMESH_DIR/lib" \
+            -lOpenMeshCore \
+            -lOpenMeshTools
+}
+
 # CUDA Configuration
 CUDA_PATH = C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1
 # GTX 1650 is compute capability 7.5, so compile for sm_75.
@@ -71,7 +82,8 @@ SOURCES += \
     ImageProcessor.cpp \
     LoginDialog.cpp \
     main.cpp \
-    mainwindow.cpp
+    mainwindow.cpp \
+    MeshSimplifier.cpp
 
 HEADERS += \
     GLWidget.h \
@@ -79,7 +91,8 @@ HEADERS += \
     ImageProcessor.h \
     LoginDialog.h \
     mainwindow.h \
-    MarchingCubes.h
+    MarchingCubes.h \
+    MeshSimplifier.h
 
 FORMS += \
     mainwindow.ui \

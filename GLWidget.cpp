@@ -128,6 +128,19 @@ void GLWidget::createShaders() {
     modelLoc = glGetUniformLocation(shaderProgram, "model");
     viewLoc = glGetUniformLocation(shaderProgram, "view");
     projLoc = glGetUniformLocation(shaderProgram, "projection");
+    
+    // Material visualization uniform locations
+    materialColorsEnabledLoc = glGetUniformLocation(shaderProgram, "materialColorsEnabled");
+    colorLoc = glGetAttribLocation(shaderProgram, "aColor");
+    
+    for (int i = 0; i < 3; ++i) {
+        char materialColorName[32];
+        char materialVisibilityName[32];
+        snprintf(materialColorName, sizeof(materialColorName), "materialColors[%d]", i);
+        snprintf(materialVisibilityName, sizeof(materialVisibilityName), "materialVisibility[%d]", i);
+        materialColorLoc[i] = glGetUniformLocation(shaderProgram, materialColorName);
+        materialVisibilityLoc[i] = glGetUniformLocation(shaderProgram, materialVisibilityName);
+    }
 
     qDebug() << "Shader program ID:" << shaderProgram;
     qDebug() << "Uniform locations - model:" << modelLoc << "view:" << viewLoc << "projection:" << projLoc;
@@ -234,7 +247,10 @@ void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsi
     // Delete existing buffers if they exist
     if (vbo.isCreated()) vbo.destroy();
     if (ibo.isCreated()) ibo.destroy();
-
+    if (vao.isCreated()) vao.destroy();
+    
+    // Create fresh VAO
+    vao.create();
     vao.bind();
 
     // Upload vertex data
@@ -250,6 +266,9 @@ void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsi
     // Normal attribute
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(3 * sizeof(float)));
     glEnableVertexAttribArray(1);
+    // Ensure color overlay attribute does not read stale buffer state for plain mesh uploads.
+    glDisableVertexAttribArray(2);
+    hasPerVertexColors = false;
 
     // Upload index data
     ibo.create();
@@ -288,6 +307,202 @@ void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsi
     emit meshUpdateComplete(); // Notify when OpenGL operations are done
 }
 
+void GLWidget::updateMeshWithMaterials(const QVector<QVector3D>& vertices,
+                                        const QVector<unsigned int>& indices,
+                                        const QVector<QColor>& vertexColors) {
+    // Upload mesh vertices and indices along with per-vertex colors in a single coherent operation
+    qDebug() << "Updating mesh with materials:" << vertices.size() << "vertices," << indices.size() << "indices," << vertexColors.size() << "colors";
+
+    const bool hugeMesh = (vertices.size() > 1200000 || indices.size() > 3600000);
+    const int eventStride = hugeMesh ? 1200000 : std::numeric_limits<int>::max();
+    
+    makeCurrent();
+
+    // Delete existing buffers
+    if (vbo.isCreated()) vbo.destroy();
+    if (ibo.isCreated()) ibo.destroy();
+    if (colorVbo.isCreated()) colorVbo.destroy();
+    if (vao.isCreated()) vao.destroy();
+    
+    // Create fresh VAO
+    vao.create();
+    vao.bind();
+
+    // Build interleaved vertex data (position + normal)
+    QVector<float> interleaved;
+    QVector<QVector3D> normals(vertices.size(), QVector3D(0.0f, 0.0f, 0.0f));
+    
+    // Calculate normals from faces
+    for (int i = 0; i + 2 < indices.size(); i += 3) {
+        const unsigned int ia = indices[i];
+        const unsigned int ib = indices[i + 1];
+        const unsigned int ic = indices[i + 2];
+        if (ia >= static_cast<unsigned int>(vertices.size()) ||
+            ib >= static_cast<unsigned int>(vertices.size()) ||
+            ic >= static_cast<unsigned int>(vertices.size())) {
+            continue;
+        }
+
+        const QVector3D& v0 = vertices[ia];
+        const QVector3D& v1 = vertices[ib];
+        const QVector3D& v2 = vertices[ic];
+        QVector3D faceNormal = QVector3D::crossProduct(v1 - v0, v2 - v0);
+        if (faceNormal.lengthSquared() > 1e-12f) {
+            normals[ia] += faceNormal;
+            normals[ib] += faceNormal;
+            normals[ic] += faceNormal;
+        }
+
+        if (i > 0 && (i % eventStride == 0)) {
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        }
+    }
+
+    // Interleave vertex and normal data
+    interleaved.resize(vertices.size() * 6);
+    float* interleavedData = interleaved.data();
+    for (int i = 0; i < vertices.size(); ++i) {
+        QVector3D n = normals[i];
+        if (n.lengthSquared() <= 1e-12f) {
+            n = QVector3D(0.0f, 0.0f, 1.0f);
+        } else {
+            n.normalize();
+        }
+
+        const QVector3D& v = vertices[i];
+        const int base = i * 6;
+        interleavedData[base + 0] = v.x();
+        interleavedData[base + 1] = v.y();
+        interleavedData[base + 2] = v.z();
+        interleavedData[base + 3] = n.x();
+        interleavedData[base + 4] = n.y();
+        interleavedData[base + 5] = n.z();
+
+        if (i > 0 && (i % eventStride == 0)) {
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        }
+    }
+
+    // Upload vertex data
+    vbo.create();
+    vbo.bind();
+    vbo.allocate(interleaved.constData(), static_cast<int>(interleaved.size() * sizeof(float)));
+    qDebug() << "Vertex buffer size:" << vbo.size() << "bytes";
+
+    const GLsizei stride = static_cast<GLsizei>(6 * sizeof(float));
+    // Position attribute
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(0);
+    // Normal attribute
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    // Upload color data
+    QVector<float> colorData;
+    colorData.reserve(vertices.size() * 4);
+    
+    if (vertexColors.size() == vertices.size()) {
+        currentVertexColors = vertexColors;
+        
+        // Debug: sample first few colors
+        if (!vertexColors.isEmpty()) {
+            const QColor& firstColor = vertexColors.first();
+            qDebug() << "[Material Colors] First vertex: RGB" 
+                     << firstColor.red() << firstColor.green() << firstColor.blue() 
+                     << "Alpha" << firstColor.alpha() << "("  << firstColor.alphaF() << ")";
+        }
+        
+        for (const QColor& color : vertexColors) {
+            colorData.append(color.redF());
+            colorData.append(color.greenF());
+            colorData.append(color.blueF());
+            colorData.append(color.alphaF());
+        }
+    } else {
+        qWarning() << "[Material Colors] Color count mismatch! Expected" << vertices.size() << "got" << vertexColors.size();
+        // Default transparent if color count doesn't match
+        for (int i = 0; i < vertices.size(); ++i) {
+            colorData.append(1.0f);
+            colorData.append(1.0f);
+            colorData.append(1.0f);
+            colorData.append(0.0f);
+        }
+    }
+
+    colorVbo.create();
+    colorVbo.bind();
+    colorVbo.allocate(colorData.constData(), static_cast<int>(colorData.size() * sizeof(float)));
+    
+    // Color attribute pointer
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), nullptr);
+    glEnableVertexAttribArray(2);
+
+    // Upload index data
+    ibo.create();
+    ibo.bind();
+    ibo.allocate(indices.constData(), static_cast<int>(indices.size() * sizeof(unsigned int)));
+    qDebug() << "Index buffer size:" << ibo.size() << "bytes";
+
+    indexCount = static_cast<size_t>(indices.size());
+
+    // Calculate mesh bounds
+    QVector3D minBounds, maxBounds;
+    if (!vertices.isEmpty()) {
+        minBounds = vertices[0];
+        maxBounds = vertices[0];
+        for (const QVector3D& v : vertices) {
+            minBounds.setX(qMin(minBounds.x(), v.x()));
+            minBounds.setY(qMin(minBounds.y(), v.y()));
+            minBounds.setZ(qMin(minBounds.z(), v.z()));
+            maxBounds.setX(qMax(maxBounds.x(), v.x()));
+            maxBounds.setY(qMax(maxBounds.y(), v.y()));
+            maxBounds.setZ(qMax(maxBounds.z(), v.z()));
+        }
+        meshSize = qMax(qMax(maxBounds.x() - minBounds.x(), maxBounds.y() - minBounds.y()), maxBounds.z() - minBounds.z());
+        meshCenter = (minBounds + maxBounds) * 0.5f;
+        qDebug() << "Mesh size:" << meshSize << "Center:" << meshCenter;
+    }
+
+    hasPerVertexColors = true;
+
+    doneCurrent();
+    update();
+    emit meshUpdateComplete();
+}
+
+void GLWidget::setMaterialColorsEnabled(bool enabled) {
+    materialColorsEnabled = enabled;
+    update();
+}
+
+void GLWidget::setMaterialColor(int materialType, const QColor& color) {
+    if (materialType >= 0 && materialType < 3) {
+        materialColors[materialType] = color;
+        update();
+    }
+}
+
+void GLWidget::setMaterialVisibility(int materialType, bool visible) {
+    if (materialType >= 0 && materialType < 3) {
+        materialVisibility[materialType] = visible;
+        update();
+    }
+}
+
+QColor GLWidget::getMaterialColor(int materialType) const {
+    if (materialType >= 0 && materialType < 3) {
+        return materialColors[materialType];
+    }
+    return QColor(128, 128, 128);
+}
+
+bool GLWidget::isMaterialVisible(int materialType) const {
+    if (materialType >= 0 && materialType < 3) {
+        return materialVisibility[materialType];
+    }
+    return true;
+}
+
 void GLWidget::paintGL() {
     makeCurrent();
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -321,6 +536,9 @@ void GLWidget::paintGL() {
     glUniformMatrix4fv(modelLoc, 1, GL_FALSE, model.data());
     glUniformMatrix4fv(viewLoc, 1, GL_FALSE, view.data());
     glUniformMatrix4fv(projLoc, 1, GL_FALSE, projection.data());
+    
+    // tell shader should use material colors or not
+    glUniform1i(materialColorsEnabledLoc, materialColorsEnabled && hasPerVertexColors ? 1 : 0);
 
     // Bind VAO and draw
     vao.bind();

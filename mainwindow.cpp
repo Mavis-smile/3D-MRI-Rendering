@@ -12,6 +12,10 @@
 #include <QSharedPointer>
 #include <QThreadPool>
 #include <QScrollArea>
+#include <QCheckBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFormLayout>
 #include <QMessageBox>
 #include <opencv2/opencv.hpp>
 #include <QPushButton>
@@ -21,6 +25,7 @@
 #include <QTextStream>
 #include <QRegularExpression>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <algorithm>
 #include <atomic>
 #include <numeric>
@@ -29,6 +34,8 @@
 #include <cstring>
 #include <cmath>
 #include <limits>
+
+#include "MeshSimplifier.h"
 
 namespace {
 struct LoadedSliceResult {
@@ -57,6 +64,19 @@ struct StlExportResult {
     qint64 expectedBytes = 0;
     int skippedInvalidTriangles = 0;
     int skippedDegenerateTriangles = 0;
+};
+
+enum class ExportPreset {
+    Ultra,
+    Medium,
+    Low
+};
+
+struct ExportOptions {
+    bool simplifyBeforeExport = false;
+    ExportPreset preset = ExportPreset::Ultra;
+    int targetFaceCount = 0;
+    double aggressiveness = 1.0;
 };
 
 quint32 floatBits(float value) {
@@ -114,11 +134,126 @@ void compactIndexedMesh(QVector<QVector3D>* vertices, QVector<unsigned int>* ind
     indices->swap(compactIndices);
 }
 
+qint64 estimateBinaryStlBytes(int triangleCount)
+{
+    if (triangleCount <= 0) {
+        return 84;
+    }
+    return 84LL + (static_cast<qint64>(triangleCount) * 50LL);
+}
+
+QString formatMegabytes(qint64 bytes)
+{
+    return QString::number(static_cast<double>(bytes) / (1024.0 * 1024.0), 'f', 2);
+}
+
+QString presetName(ExportPreset preset)
+{
+    switch (preset) {
+    case ExportPreset::Ultra: return QStringLiteral("Ultra");
+    case ExportPreset::Medium: return QStringLiteral("Medium");
+    case ExportPreset::Low: return QStringLiteral("Low");
+    }
+    return QStringLiteral("Ultra");
+}
+
+double presetKeepRatio(ExportPreset preset)
+{
+    switch (preset) {
+    case ExportPreset::Ultra: return 1.0;
+    case ExportPreset::Medium: return 0.65;
+    case ExportPreset::Low: return 0.35;
+    }
+    return 1.0;
+}
+
+ExportPreset recommendedPreset(int triangleCount, qint64 estimatedBytes)
+{
+    if (triangleCount >= 3000000 || estimatedBytes >= 500LL * 1024LL * 1024LL) {
+        return ExportPreset::Low;
+    }
+    if (triangleCount >= 300000) {
+        return ExportPreset::Medium;
+    }
+    if (triangleCount >= 100000) {
+        return ExportPreset::Low;
+    }
+    return ExportPreset::Ultra;
+}
+
+void logExportEstimate(int triangleCount, qint64 estimatedBytes)
+{
+    qDebug().noquote() << "-------";
+    qDebug().noquote() << QString("Triangles: %1").arg(triangleCount);
+    qDebug().noquote() << QString("Estimated Binary STL Size: %1 MB").arg(formatMegabytes(estimatedBytes));
+    qDebug().noquote() << "-------------------------------";
+    if (estimatedBytes > 200LL * 1024LL * 1024LL) {
+        qWarning() << "Estimated binary STL size exceeds 200 MB; simplification is recommended.";
+    }
+}
+
+bool promptExportOptions(QWidget* parent, int triangleCount, qint64 estimatedBytes, ExportOptions* options)
+{
+    if (!options) {
+        return false;
+    }
+
+    QDialog dialog(parent);
+    dialog.setWindowTitle("Export STL Options");
+
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* form = new QFormLayout();
+
+    auto* simplifyCheck = new QCheckBox("Simplify before export (keep 35% triangles)", &dialog);
+    simplifyCheck->setChecked(estimatedBytes > 200LL * 1024LL * 1024LL);
+
+    auto* estimateLabel = new QLabel(&dialog);
+    estimateLabel->setWordWrap(true);
+    
+    // Lambda to update the estimate label based on checkbox state
+    auto updateEstimate = [simplifyCheck, estimateLabel, triangleCount]() {
+        if (simplifyCheck->isChecked()) {
+            const int estimatedTriangles = qMax(1, int(std::lround(double(triangleCount) * 0.35)));
+            const qint64 estimatedSize = 84LL + (static_cast<qint64>(estimatedTriangles) * 50LL);
+            estimateLabel->setText(QString("Estimated after simplification:\n~%1 triangles (~%2 MB)")
+                                      .arg(estimatedTriangles)
+                                      .arg(formatMegabytes(estimatedSize)));
+        } else {
+            estimateLabel->setText("");
+        }
+    };
+
+    QObject::connect(simplifyCheck, &QCheckBox::toggled, updateEstimate);
+
+    form->addRow(simplifyCheck);
+    form->addRow(estimateLabel);
+    layout->addLayout(form);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addWidget(buttons);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    // Update estimate on initial load
+    updateEstimate();
+
+    if (dialog.exec() != QDialog::Accepted) {
+        return false;
+    }
+
+    options->simplifyBeforeExport = simplifyCheck->isChecked();
+    options->preset = ExportPreset::Low;  // Always use Low preset (35% triangles)
+    options->targetFaceCount = qMax(1, int(std::lround(double(triangleCount) * 0.35)));
+    options->aggressiveness = 2.5;  // Conservative aggressiveness; internal anatomy preservation via smart triangle classification handles target achievement
+    return true;
+}
+
 StlExportResult exportMeshToBinaryStlFile(
     const QString& fileName,
     const QVector<QVector3D>& vertices,
     const QVector<unsigned int>& indices,
-    const std::function<void(int, const QString&)>& progressCallback
+    const std::function<void(int, const QString&)>& progressCallback,
+    const std::function<bool()>& cancelCallback = std::function<bool()>()
 ) {
     StlExportResult result;
 
@@ -128,7 +263,7 @@ StlExportResult exportMeshToBinaryStlFile(
         }
     };
 
-    reportProgress(1, "Opening STL output file...");
+    reportProgress(1, QString("[1%] Opening STL output file..."));
 
     QSaveFile file(fileName);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -165,9 +300,14 @@ StlExportResult exportMeshToBinaryStlFile(
     const int reportStride = qMax(1, triangleCount / 200);
     int processedTriangles = 0;
 
-    reportProgress(5, QString("Writing STL triangles (0/%1)...").arg(triangleCount));
+    reportProgress(5, QString("[5%] Writing STL triangles (0/%1)...").arg(triangleCount));
 
     for (int i = 0; i + 2 < indices.size(); i += 3) {
+        if (cancelCallback && cancelCallback()) {
+            result.errorMessage = "STL export canceled.";
+            return result;
+        }
+
         const unsigned int i0 = indices[i];
         const unsigned int i1 = indices[i + 1];
         const unsigned int i2 = indices[i + 2];
@@ -209,8 +349,13 @@ StlExportResult exportMeshToBinaryStlFile(
 
         if (processedTriangles % reportStride == 0 || processedTriangles == triangleCount) {
             const int progress = 5 + int((90.0 * double(processedTriangles)) / double(qMax(1, triangleCount)));
-            reportProgress(progress, QString("Writing STL triangles %1/%2...").arg(processedTriangles).arg(triangleCount));
+            reportProgress(progress, QString("[%1%] Writing STL triangles %2/%3...").arg(progress).arg(processedTriangles).arg(triangleCount));
         }
+    }
+
+    if (cancelCallback && cancelCallback()) {
+        result.errorMessage = "STL export canceled.";
+        return result;
     }
 
     if (!file.seek(80)) {
@@ -238,7 +383,7 @@ StlExportResult exportMeshToBinaryStlFile(
     }
 
     result.success = true;
-    reportProgress(100, QString("STL export complete (%1 triangles).").arg(result.writtenTriangles));
+    reportProgress(100, QString("[100%] STL export complete (%1 triangles).").arg(result.writtenTriangles));
     return result;
 }
 
@@ -2027,7 +2172,7 @@ void MainWindow::createMenu() {
 }
 
 void MainWindow::createToolbar() {
-    QToolBar* toolBar = addToolBar("Main Toolbar");
+    toolBar = addToolBar("Main Toolbar");
     toolBar->setIconSize(QSize(32, 32));
     toolBar->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
     toolBar->setMovable(false);
@@ -2099,6 +2244,12 @@ void MainWindow::createToolbar() {
 
     segmentationLayout->addLayout(controlsLayout);
 
+    // Second row: Material Colors checkbox sits directly under the Threshold label.
+    materialColorsCheckBox = new QCheckBox("Material Colors", this);
+    materialColorsCheckBox->setChecked(false);
+    materialColorsCheckBox->setEnabled(false);
+    segmentationLayout->addWidget(materialColorsCheckBox);
+
     toolBar->addSeparator();
     QWidget* toolbarSpacer = new QWidget(this);
     toolbarSpacer->setFixedWidth(28);
@@ -2111,7 +2262,10 @@ void MainWindow::createToolbar() {
             &MainWindow::onThreshold16Changed);
     connect(threshold16AutoButton, &QPushButton::clicked, this, &MainWindow::onThreshold16Auto);
 
-        syncThresholdControls();
+    // Add material visualization controls
+    addMaterialVisualizationControls();
+
+    syncThresholdControls();
 }
 
 
@@ -2234,6 +2388,16 @@ void MainWindow::loadImages(const QStringList& filePaths) {
     loadedImages.reserve(filePaths.size());
     originalImages.reserve(filePaths.size());
     segmentationSlices16.reserve(filePaths.size());
+
+    // Reset Material Colors state when new dataset is loaded
+    if (materialColorsCheckBox) {
+        materialColorsCheckBox->blockSignals(true);
+        materialColorsCheckBox->setChecked(false);
+        materialColorsCheckBox->setEnabled(false);
+        materialColorsCheckBox->blockSignals(false);
+    }
+    materialColorsEnabled = false;
+    glWidget->setMaterialColorsEnabled(false);
 
     if (mainTabs && mainTabs->count() > 1) {
         mainTabs->setTabEnabled(1, false);
@@ -3677,6 +3841,134 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
     return volume;
 }
 
+MainWindow::VolumeData16 MainWindow::buildRawVolume16(const QVector<cv::Mat>& slices16) const {
+    VolumeData16 volume;
+
+    if (slices16.isEmpty()) {
+        return volume;
+    }
+
+    const int width = slices16.first().cols;
+    const int height = slices16.first().rows;
+    const int depth = slices16.size();
+
+    volume.resize(depth);
+    for (int z = 0; z < depth; ++z) {
+        volume[z].resize(height);
+        for (int y = 0; y < height; ++y) {
+            volume[z][y].resize(width);
+            const quint16* row = slices16[z].ptr<quint16>(y);
+            for (int x = 0; x < width; ++x) {
+                volume[z][y][x] = row ? row[x] : 0;
+            }
+        }
+    }
+
+    return volume;
+}
+
+// histogram-based heuristic to estimate material thresholds for 16-bit segmentation volumes
+void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& ceramicThreshold16, int& boneThreshold16) const {
+    ceramicThreshold16 = 200;
+    boneThreshold16 = 100;
+
+    if (volume16.isEmpty() || volume16[0].isEmpty() || volume16[0][0].isEmpty()) {
+        return;
+    }
+
+    QVector<int> histogram(256, 0);
+    qint64 totalSamples = 0;
+
+    for (const auto& slice : volume16) {
+        for (const auto& row : slice) {
+            for (quint16 value : row) {
+                if (value == 0) {
+                    continue;
+                }
+                const int normalized = qBound(0, int(qRound(value / 257.0)), 255);
+                ++histogram[normalized];
+                ++totalSamples;
+            }
+        }
+    }
+
+    if (totalSamples <= 0) {
+        return;
+    }
+
+    auto percentileFromHistogram = [&](double percentile) -> int {
+        const qint64 target = qMax<qint64>(1, qRound(totalSamples * percentile));
+        qint64 cumulative = 0;
+        for (int i = 0; i < histogram.size(); ++i) {
+            cumulative += histogram[i];
+            if (cumulative >= target) {
+                return i;
+            }
+        }
+        return 255;
+    };
+
+    boneThreshold16 = qBound(10, percentileFromHistogram(0.60), 230);
+
+    // *** KEY FIX: Use currentThreshold16 (the Otsu/user bone threshold used by
+    // Marching Cubes) as the lower cutoff for ceramic analysis.
+    //
+    // Previous approach (percentile of ALL voxels) failed because:
+    //   - 95th pct of 835M voxels (mostly air/soft tissue) lands at ~114 normalized
+    //   - currentThreshold16=28180 -> normalized=110  (bone/background boundary)
+    //   - ceramic threshold 114 was only 4 above bone -> classifies all dense bone as ceramic
+    //
+    // Correct approach: build a RESTRICTED histogram of only voxels brighter than the
+    // Otsu bone cutoff, then take the 75th percentile of THAT bright subset.
+    // This means "top 25% of foreground-bright voxels" = ceramic/metal density.
+    const int boneCutoffNorm = qBound(boneThreshold16,
+                                      int(qRound(currentThreshold16 / 257.0)),
+                                      240);
+
+    qint64 brightTotal = 0;
+    for (int i = boneCutoffNorm; i < 256; ++i) {
+        brightTotal += histogram[i];
+    }
+
+    int ceramicCandidate = boneCutoffNorm + 10;  // safe fallback
+    if (brightTotal > 0) {
+        const qint64 ceramicTarget = qMax<qint64>(1, qRound(brightTotal * 0.75));
+        qint64 brightCumulative = 0;
+        for (int i = boneCutoffNorm; i < 256; ++i) {
+            brightCumulative += histogram[i];
+            if (brightCumulative >= ceramicTarget) {
+                ceramicCandidate = i;
+                break;
+            }
+        }
+    }
+
+    ceramicThreshold16 = qBound(boneCutoffNorm + 5, ceramicCandidate, 255);
+
+    // --- Diagnostic logging ---
+    qDebug().noquote() << "-----[ Threshold Estimation ]-----";
+    qDebug() << "  Classification: 16-bit raw data normalized to 8-bit (0-255) for comparison";
+    qDebug() << "  Voxels analyzed (non-zero):" << totalSamples;
+    qDebug() << "  Bone threshold (60th pct of all voxels, 0-255):" << boneThreshold16;
+    qDebug() << "  currentThreshold16 (Otsu/user, raw 16-bit):" << currentThreshold16
+             << " => normalized:" << boneCutoffNorm;
+    qDebug() << "  Bright voxels (>= boneCutoff):" << brightTotal
+             << QString("(%1% of foreground)").arg(100.0 * brightTotal / double(totalSamples), 0, 'f', 2);
+    qDebug() << "  Ceramic threshold (75th pct of bright voxels, 0-255):" << ceramicThreshold16;
+    qDebug() << "  Histogram tail (8-bin sums, 0-255 normalized):";
+    for (int i = 80; i < 256; i += 8) {
+        qint64 sum = 0;
+        for (int j = i; j < qMin(i + 8, 256); ++j) sum += histogram[j];
+        if (sum > 0) {
+            const QString marker = (i <= boneCutoffNorm && boneCutoffNorm < i + 8) ? " <-- bone cutoff"
+                                 : (i <= ceramicThreshold16 && ceramicThreshold16 < i + 8) ? " <-- ceramic threshold"
+                                 : "";
+            qDebug().noquote() << QString("    [%1-%2]: %3%4").arg(i,3).arg(i+7,3).arg(sum).arg(marker);
+        }
+    }
+    qDebug().noquote() << "-----[ Threshold Estimation End ]-----";
+}
+
  void MainWindow::updateIsoLevel(int value) {
      qDebug() << "Entering updateIsoLevel";
 
@@ -3721,7 +4013,15 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
      if (mainTabs && mainTabs->count() > 0) {
          mainTabs->setCurrentIndex(0);
      }
-     glWidget->updateMesh(currentMesh.vertices, currentMesh.indices);
+     
+     // Apply material classification if enabled and available
+     if (!currentSegmentationVolume16.isEmpty() && materialColorsEnabled) {
+         MarchingCubes::Mesh classifiedMesh = classifyMeshByMaterial(currentMesh, currentSegmentationVolume16);
+         glWidget->updateMeshWithMaterials(classifiedMesh.vertices, classifiedMesh.indices, classifiedMesh.vertexColors);
+     } else {
+         glWidget->updateMesh(currentMesh.vertices, currentMesh.indices);
+     }
+     
      glWidget->update();
 
      qDebug() << "Exiting updateIsoLevel";
@@ -3769,17 +4069,32 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
          return;
      }
 
+     const int triangleCount = currentMesh.indices.size() / 3;
+     const qint64 estimatedBytes = estimateBinaryStlBytes(triangleCount);
+     logExportEstimate(triangleCount, estimatedBytes);
+
+     ExportOptions exportOptions;
+     if (!promptExportOptions(this, triangleCount, estimatedBytes, &exportOptions)) {
+         return;
+     }
+
      qDebug() << "[STL Export] Start | vertices:" << currentMesh.vertices.size()
-              << "indices:" << currentMesh.indices.size();
+              << "indices:" << currentMesh.indices.size()
+              << "preset:" << presetName(exportOptions.preset)
+              << "simplify:" << (exportOptions.simplifyBeforeExport ? "yes" : "no")
+              << "targetFaces:" << exportOptions.targetFaceCount
+              << "aggressiveness:" << exportOptions.aggressiveness;
 
      QString fileName = QFileDialog::getSaveFileName(this, "Save STL File", "", "STL Files (*.stl)");
-     if (fileName.isEmpty()) return;
+     if (fileName.isEmpty()) {
+         return;
+     }
      if (!fileName.endsWith(".stl", Qt::CaseInsensitive)) {
          fileName += ".stl";
      }
      qDebug() << "[STL Export] Target path:" << fileName;
 
-    stlTimer.start();
+     stlTimer.start();
 
      isExportingStl = true;
      if (generate3DAct) generate3DAct->setEnabled(false);
@@ -3787,7 +4102,7 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
      if (threshold16SpinBox) threshold16SpinBox->setEnabled(false);
      if (threshold16AutoButton) threshold16AutoButton->setEnabled(false);
 
-     auto* exportDialog = new QProgressDialog("Preparing STL export...", QString(), 0, 100, this);
+     auto* exportDialog = new QProgressDialog("Preparing STL export...", "Cancel", 0, 100, this);
      exportDialog->setWindowTitle("STL Export Progress");
      exportDialog->setWindowModality(Qt::NonModal);
      exportDialog->setMinimumDuration(0);
@@ -3796,71 +4111,170 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
      exportDialog->show();
      centerDialogOnWidget(exportDialog, this);
 
-     auto* watcher = new QFutureWatcher<StlExportResult>(this);
+     QPointer<MainWindow> weakWindow(this);
+     QPointer<QProgressDialog> weakDialog(exportDialog);
+     auto cancelRequested = std::make_shared<std::atomic_bool>(false);
+     connect(exportDialog, &QProgressDialog::canceled, this, [cancelRequested]() {
+         cancelRequested->store(true, std::memory_order_relaxed);
+     });
 
-     connect(watcher, &QFutureWatcher<StlExportResult>::finished, this,
-             [this, watcher, exportDialog, fileName]() {
-         const StlExportResult result = watcher->result();
+     auto finishUi = [this, exportDialog]() {
          isExportingStl = false;
          if (generate3DAct) generate3DAct->setEnabled(true);
          if (exportSTLAct) exportSTLAct->setEnabled(true);
          if (threshold16SpinBox) threshold16SpinBox->setEnabled(true);
          if (threshold16AutoButton) threshold16AutoButton->setEnabled(true);
-
          if (exportDialog) {
              exportDialog->close();
              exportDialog->deleteLater();
          }
+     };
 
-         if (!result.success) {
-             qWarning() << "[STL Export] Failed:" << result.errorMessage;
-             QMessageBox::warning(this,
-                                  "Export Failed",
-                                  result.errorMessage.isEmpty()
-                                      ? "STL export failed."
-                                      : result.errorMessage);
+     auto startBinaryExport = [this, fileName, weakWindow, weakDialog, cancelRequested, finishUi](MarchingCubes::Mesh meshToExport) mutable {
+         if (cancelRequested->load(std::memory_order_relaxed)) {
+             finishUi();
              return;
          }
 
-         qDebug().noquote() << "-------";
-         qDebug().noquote() << QString("Export STL: %1 s").arg(double(stlTimer.elapsed()) / 1000.0, 0, 'f', 2);
-         qDebug() << "[STL Export] Success | triangles:" << result.writtenTriangles
-                  << "bytes:" << result.bytesOnDisk;
-         if (result.skippedInvalidTriangles > 0) {
-             qWarning() << "[STL Export] Skipped" << result.skippedInvalidTriangles << "invalid triangle(s).";
-         }
-         if (result.skippedDegenerateTriangles > 0) {
-             qWarning() << "[STL Export] Skipped" << result.skippedDegenerateTriangles << "degenerate triangle(s).";
-         }
-         qDebug() << "[STL Export] Completed with" << result.writtenTriangles << "triangle(s).";
-         qDebug().noquote() << "-------";
-     });
+         auto* watcher = new QFutureWatcher<StlExportResult>(this);
+         connect(watcher, &QFutureWatcher<StlExportResult>::finished, this,
+                 [this, watcher, finishUi]() {
+             const StlExportResult result = watcher->result();
 
-     QPointer<MainWindow> weakWindow(this);
-     QPointer<QProgressDialog> weakDialog(exportDialog);
+             finishUi();
 
-     watcher->setFuture(QtConcurrent::run([fileName,
-                                           verticesCopy = currentMesh.vertices,
-                                           indicesCopy = currentMesh.indices,
-                                           weakWindow,
-                                           weakDialog]() mutable -> StlExportResult {
-         return exportMeshToBinaryStlFile(
-             fileName,
-             verticesCopy,
-             indicesCopy,
-             [weakWindow, weakDialog](int progress, const QString& message) {
-                 if (!weakWindow) {
-                     return;
-                 }
+             if (!result.success) {
+                 qWarning() << "[STL Export] Failed:" << result.errorMessage;
+                 QMessageBox::warning(this,
+                                      "Export Failed",
+                                      result.errorMessage.isEmpty()
+                                          ? "STL export failed."
+                                          : result.errorMessage);
+                 watcher->deleteLater();
+                 return;
+             }
 
-                 QMetaObject::invokeMethod(weakWindow.data(), [weakDialog, progress, message]() {
-                     if (!weakDialog) {
+             qDebug().noquote() << "-------";
+             qDebug().noquote() << QString("Export STL: %1 s").arg(double(stlTimer.elapsed()) / 1000.0, 0, 'f', 2);
+             qDebug() << "[STL Export] Success | triangles:" << result.writtenTriangles
+                      << "bytes:" << result.bytesOnDisk;
+             if (result.skippedInvalidTriangles > 0) {
+                 qWarning() << "[STL Export] Skipped" << result.skippedInvalidTriangles << "invalid triangle(s).";
+             }
+             if (result.skippedDegenerateTriangles > 0) {
+                 qWarning() << "[STL Export] Skipped" << result.skippedDegenerateTriangles << "degenerate triangle(s).";
+             }
+             qDebug() << "[STL Export] Completed with" << result.writtenTriangles << "triangle(s).";
+             qDebug().noquote() << "-------";
+             watcher->deleteLater();
+         });
+
+         watcher->setFuture(QtConcurrent::run([fileName,
+                                               verticesCopy = meshToExport.vertices,
+                                               indicesCopy = meshToExport.indices,
+                                               weakWindow,
+                                               weakDialog,
+                                               cancelRequested]() mutable -> StlExportResult {
+             return exportMeshToBinaryStlFile(
+                 fileName,
+                 verticesCopy,
+                 indicesCopy,
+                 [weakWindow, weakDialog](int progress, const QString& message) {
+                     if (!weakWindow) {
                          return;
                      }
-                     weakDialog->setValue(qBound(0, progress, 100));
-                     weakDialog->setLabelText(message);
-                 }, Qt::QueuedConnection);
-             });
+
+                     QMetaObject::invokeMethod(weakWindow.data(), [weakDialog, progress, message]() {
+                         if (!weakDialog) {
+                             return;
+                         }
+                         weakDialog->setValue(qBound(0, progress, 100));
+                         weakDialog->setLabelText(message);
+                     }, Qt::QueuedConnection);
+                 },
+                 [cancelRequested, weakDialog]() {
+                     return cancelRequested->load(std::memory_order_relaxed) || (weakDialog && weakDialog->wasCanceled());
+                 });
+         }));
+     };
+
+     const MarchingCubes::Mesh meshCopy = currentMesh;
+     const bool simplifyRequested = exportOptions.simplifyBeforeExport && exportOptions.preset != ExportPreset::Ultra;
+     if (!simplifyRequested) {
+         qDebug().noquote() << QString("[STL Export] Simplification skipped. checkbox=%1 preset=%2")
+                                 .arg(exportOptions.simplifyBeforeExport ? "true" : "false")
+                                 .arg(presetName(exportOptions.preset));
+         startBinaryExport(meshCopy);
+         return;
+     }
+
+     exportDialog->setValue(0);
+     exportDialog->setLabelText("Simplifying mesh with QEM...\nPlease wait...");
+     exportDialog->setRange(0, 0);
+     QApplication::processEvents();
+
+     auto* simplifyWatcher = new QFutureWatcher<MeshSimplifier::SimplifyReport>(this);
+     connect(simplifyWatcher, &QFutureWatcher<MeshSimplifier::SimplifyReport>::finished, this,
+             [this, simplifyWatcher, startBinaryExport, cancelRequested, meshCopy, exportDialog]() mutable {
+         if (cancelRequested->load(std::memory_order_relaxed)) {
+             isExportingStl = false;
+             if (generate3DAct) generate3DAct->setEnabled(true);
+             if (exportSTLAct) exportSTLAct->setEnabled(true);
+             if (threshold16SpinBox) threshold16SpinBox->setEnabled(true);
+             if (threshold16AutoButton) threshold16AutoButton->setEnabled(true);
+             if (exportDialog) {
+                 exportDialog->close();
+                 exportDialog->deleteLater();
+             }
+             simplifyWatcher->deleteLater();
+             return;
+         }
+
+         const MeshSimplifier::SimplifyReport report = simplifyWatcher->result();
+         simplifyWatcher->deleteLater();
+         qDebug().noquote() << QString("[Simplifier] completed. success=%1 inputFaces=%2 outputFaces=%3 message=%4")
+                                 .arg(report.success ? "true" : "false")
+                                 .arg(report.inputFaceCount)
+                                 .arg(report.outputFaceCount)
+                                 .arg(report.message);
+
+         if (report.outputFaceCount == report.inputFaceCount) {
+             qWarning() << "[Simplifier] Triangle count did not change; export will proceed with the original mesh unless OpenMesh produced a reduced mesh.";
+         }
+
+         if (!report.success) {
+             if (MeshSimplifier::isOpenMeshAvailable()) {
+                 isExportingStl = false;
+                 if (generate3DAct) generate3DAct->setEnabled(true);
+                 if (exportSTLAct) exportSTLAct->setEnabled(true);
+                 if (threshold16SpinBox) threshold16SpinBox->setEnabled(true);
+                 if (threshold16AutoButton) threshold16AutoButton->setEnabled(true);
+                 if (exportDialog) {
+                     exportDialog->close();
+                     exportDialog->deleteLater();
+                 }
+                 QMessageBox::warning(this, "Simplification Failed", report.message.isEmpty() ? "Mesh simplification failed." : report.message);
+                 return;
+             }
+
+             qWarning() << "[Simplifier]" << report.message << "Proceeding without simplification.";
+             startBinaryExport(meshCopy);
+             return;
+         }
+
+         qDebug() << "[Simplifier] input faces:" << report.inputFaceCount
+                  << "output faces:" << report.outputFaceCount
+                  << "backend:" << MeshSimplifier::backendName();
+         startBinaryExport(report.mesh);
+     });
+
+     if (exportDialog) {
+         exportDialog->setLabelText("Simplifying mesh with QEM...\nPlease wait...");
+     }
+     simplifyWatcher->setFuture(QtConcurrent::run([meshCopy,
+                                                   targetFaces = exportOptions.targetFaceCount,
+                                                   aggressiveness = exportOptions.aggressiveness]() {
+         return MeshSimplifier::simplifyMeshDetailed(meshCopy, targetFaces, aggressiveness);
      }));
  }
 
@@ -3879,7 +4293,11 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
 
      isGeneratingMesh = true;
      statusBar()->showMessage("Starting mesh generation...");
-    updateLoadingDialog(0, "Generating 3D mesh...");
+    // Reset dialog state here (not in finalize) to avoid re-show via setValue
+    loadingDialog->reset();
+    loadingDialog->setRange(0, 100);
+    loadingDialog->setValue(0);
+    loadingDialog->setLabelText("Generating 3D mesh...");
     loadingDialog->show();
     centerDialogOnWidget(loadingDialog, this);
     QApplication::processEvents();
@@ -3911,6 +4329,7 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
          VolumeData volume;
          if (hasSegmentation16Data && !segmentationSlices16.isEmpty() && segmentationSlices16.size() == loadedImages.size()) {
              qDebug() << "Using native 16-bit segmentation path for mesh generation.";
+             currentSegmentationVolume16 = buildRawVolume16(segmentationSlices16);
              volume = convertToVolume16(segmentationSlices16, currentThreshold16, 1.0f, reportProgress);
          } else {
              // Fallback path for non-16-bit stacks.
@@ -3924,6 +4343,7 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
              }
 
              qDebug() << "Using 8-bit thresholded image path for mesh generation.";
+             currentSegmentationVolume16.clear();
              volume = convertToVolume(*meshSource, reportProgress);
          }
 
@@ -3978,7 +4398,35 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
         }
         updateLoadingDialog(92, "Uploading mesh to renderer...");
         currentMesh = pendingMesh; // Update currentMesh for export
-        glWidget->updateMesh(currentMesh.vertices, currentMesh.indices);
+        
+        // Enable Material Colors controls now that mesh exists
+        if (materialColorsCheckBox) {
+            materialColorsCheckBox->setEnabled(true);
+            // Auto-check Material Colors after mesh generation
+            materialColorsCheckBox->blockSignals(true);
+            materialColorsCheckBox->setChecked(true);
+            materialColorsCheckBox->blockSignals(false);
+        }
+        // Signal must be set BEFORE the upload calls because meshUpdateComplete is emitted
+        // synchronously inside updateMesh/updateMeshWithMaterials, which triggers
+        // handleMeshRenderingFinished before execution returns here.
+        waitingForMeshUploadCompletion = true;
+        isGeneratingMesh = false;
+
+        // Classify mesh by material and upload with colors
+        if (!currentSegmentationVolume16.isEmpty()) {
+            qDebug() << "Classifying mesh with materials from segmentation volume...";
+            currentMesh = classifyMeshByMaterial(currentMesh, currentSegmentationVolume16);
+            glWidget->updateMeshWithMaterials(currentMesh.vertices, currentMesh.indices, currentMesh.vertexColors);
+        } else {
+            // If no segmentation volume, upload without materials
+            glWidget->updateMesh(currentMesh.vertices, currentMesh.indices);
+        }
+
+        // Mark generation complete and enable material overlay
+        materialColorsEnabled = true;
+        glWidget->setMaterialColorsEnabled(true);
+
         qDebug().noquote() << "-------";
         qDebug().noquote() << QString("Generate 3D: %1 s").arg(double(meshTimer.elapsed()) / 1000.0, 0, 'f', 2);
      } else {
@@ -3987,9 +4435,13 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
  }
 
  void MainWindow::handleMeshRenderingFinished() {
-     isGeneratingMesh = false;
-     updateLoadingDialog(100, "Mesh upload complete");
-     loadingDialog->hide();
+    const bool shouldFinalize = (waitingForMeshUploadCompletion || isGeneratingMesh);
+    isGeneratingMesh = false;
+    waitingForMeshUploadCompletion = false;
+
+    if (shouldFinalize) {
+        finalizeMeshProgressDialog();
+    }
 
      if (pendingMesh.vertices.isEmpty()) {
          QMessageBox::warning(this, "Mesh Generation Failed",
@@ -4014,6 +4466,17 @@ void MainWindow::updateLoadingDialog(int progress, const QString& message) {
     if (!message.isEmpty()) {
         loadingDialog->setLabelText(message);
     }
+}
+
+void MainWindow::finalizeMeshProgressDialog() {
+    if (!loadingDialog) {
+        return;
+    }
+    // Close and hide ONLY — do NOT call setValue/reset here.
+    // QProgressDialog with minimumDuration=0 re-shows itself whenever setValue is called
+    // after close/hide, so we defer the reset to just before the next show() in generateMesh().
+    loadingDialog->close();
+    loadingDialog->hide();
 }
 
  void MainWindow::saveProcessedImage(const QImage& image, const QString& filePath) {
@@ -4290,3 +4753,458 @@ void MainWindow::onOtsuComputationFinished() {
         5000);
 }
 
+// ============================================================================
+// Material Visualization and Segmentation
+// ============================================================================
+
+void MainWindow::addMaterialVisualizationControls() {
+    // Checkbox is created in createToolbar() as the second row of the segmentation widget.
+    // Only wire up the signal connection here.
+    if (!materialColorsCheckBox) return;
+    connect(materialColorsCheckBox, &QCheckBox::toggled, this, &MainWindow::onMaterialColorsToggled);
+}
+
+void MainWindow::onMaterialColorsToggled(bool enabled) {
+    // Simply toggle overlay visibility - no mesh recalculation or upload
+    materialColorsEnabled = enabled;
+    glWidget->setMaterialColorsEnabled(enabled);
+    glWidget->update();
+    qDebug() << "Material Colors overlay:" << (enabled ? "ON" : "OFF");
+}
+
+MarchingCubes::Mesh MainWindow::classifyMeshByMaterial(const MarchingCubes::Mesh& inputMesh,
+                                                       const VolumeData16& volume16) {
+    MarchingCubes::Mesh outputMesh = inputMesh;
+    outputMesh.vertexColors.clear();
+    outputMesh.vertexMaterials.clear();
+
+    int ceramicThresholdLocal = 200;
+    int boneThresholdLocal = 100;
+    estimateMaterialThresholds(volume16, ceramicThresholdLocal, boneThresholdLocal);
+
+    QColor ceramicColor(50, 130, 255);
+    const int eventStride = qMax(100000, inputMesh.vertices.size() / 24);
+
+    if (volume16.isEmpty() || volume16[0].isEmpty() || volume16[0][0].isEmpty()) {
+        return outputMesh;
+    }
+    const int volDepth  = volume16.size();
+    const int volHeight = volume16[0].size();
+    const int volWidth  = volume16[0][0].size();
+    const int borderGuard = 5;
+
+    const float safeSpacingX = qMax(0.0001f, voxelSpacingX);
+    const float safeSpacingY = qMax(0.0001f, voxelSpacingY);
+    const float safeSpacingZ = qMax(0.0001f, voxelSpacingZ);
+
+    // Safe sampler: border-guarded, returns intensity in 0-255 float, or -1 for invalid.
+    auto sampleF = [&](int px, int py, int pz) -> float {
+        if (px < borderGuard || px >= volWidth  - borderGuard ||
+            py < borderGuard || py >= volHeight - borderGuard ||
+            pz < borderGuard || pz >= volDepth  - borderGuard)
+            return -1.0f;
+        return static_cast<float>(volume16[pz][py][px]) / 257.0f;
+    };
+
+    // =========================================================================
+    // Step 1: Precompute per-vertex area-weighted normals from face indices.
+    //
+    // MC typically produces outward normals.  We do NOT assume a direction —
+    // instead we sample BOTH ±normal and take the maximum Variance-to-Mean Ratio (VMR).  This makes the
+    // classifier robust to whichever way the MC normal happens to point.
+    // =========================================================================
+    qDebug() << "  [classify] Precomputing normals for"
+             << inputMesh.vertices.size() << "vertices /"
+             << (inputMesh.indices.size() / 3) << "faces...";
+    QVector<QVector3D> vertexNormals(inputMesh.vertices.size(), QVector3D(0.0f, 0.0f, 0.0f));
+    {
+        const int numIdx = inputMesh.indices.size();
+        const int nv     = inputMesh.vertices.size();
+        for (int fi = 0; fi + 2 < numIdx; fi += 3) {
+            const unsigned int i0 = inputMesh.indices[fi];
+            const unsigned int i1 = inputMesh.indices[fi + 1];
+            const unsigned int i2 = inputMesh.indices[fi + 2];
+            if ((int)i0 >= nv || (int)i1 >= nv || (int)i2 >= nv) continue;
+            const QVector3D e1 = inputMesh.vertices[i1] - inputMesh.vertices[i0];
+            const QVector3D e2 = inputMesh.vertices[i2] - inputMesh.vertices[i0];
+            const QVector3D fn = QVector3D::crossProduct(e1, e2);  // area-weighted
+            vertexNormals[i0] += fn;
+            vertexNormals[i1] += fn;
+            vertexNormals[i2] += fn;
+            if (fi % 3000000 == 0 && fi > 0)
+                QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        }
+        for (QVector3D& n : vertexNormals) {
+            const float len = n.length();
+            if (len > 1e-6f) n /= len;
+        }
+    }
+    qDebug() << "  [classify] Normals done.";
+
+    // =========================================================================
+    // Step 2: VMR + Periodicity feature-based classification
+    //
+    // PRIMARY DISCRIMINATOR: Variance-to-mean ratio (VMR = σ²/(μ+1))
+    //
+    // We sample N steps of stepMM along +normal and -normal independently and
+    // compute VMR for each direction separately, then take max(VMR+, VMR-).
+    //
+    // WHY separate directions (not bidirectional):
+    //   Bidirectional: both bone-surface AND porous-scaffold show a bright↔dark
+    //   transition, giving spuriously high VMR for cortical bone.
+    //
+    //   Unidirectional: cortical bone going inward is UNIFORM (dense→dense→dense),
+    //   VMR ≈ 0-10.  Porous scaffold going inward alternates wall/pore/wall,
+    //   VMR ≈ 40-150.  Clean separation without needing to know normal direction.
+    //
+    // WHY max(VMR+, VMR-):
+    //   We do not know whether the MC normal points into solid or into air.
+    //   max() picks whichever direction actually crosses the porous lattice.
+    //
+    // SECONDARY: Periodicity (direction reversals in the VMR-winning sample array)
+    //   Porous scaffold:  2-4 reversals in 5 samples (wall→pore→wall→pore)
+    //   Cortical bone:    0-1 reversals in 5 samples (gradual thickness decrease)
+    //   Helps reject thick trabecular bone which can have moderate VMR.
+    //
+    // TERTIARY: Intensity gate — vertex must be at or above bone threshold.
+    //
+    // WHY the old weights failed (images 1-3 showed scattered false positives):
+    //   Cut-plane surface vertex: sampling crosses bone→air in ONE step.
+    //     VMR ≈ 100 (huge), periodicity = 0 reversals.
+    //     Old score: 0.65*1.0 + 0.20*1.0 + 0.15*0.0 = 0.85 → WRONG ceramic label.
+    //   Porous scaffold vertex: wall→pore→wall in 3 steps.
+    //     Observed from log: VMR 12-20, periodicity = 1.00 reversal.
+    //     Old VMR_NORMALIZE=60 made vmrNorm=12/60=0.20 — classifier was nearly blind.
+    //     Fix: VMR_NORMALIZE calibrated to 15 so VMR=15 → vmrNorm=1.0.
+    //
+    // Hard rules (before scoring):
+    //   1. centerVal >= ceramicThreshold * 0.80  (intensity gate: blocks soft tissue)
+    //   2. periodicityScore > 0.0  (>= 1 reversal REQUIRED: blocks single-edge cut-planes)
+    //      Cut-plane vertex: bone→air in 1 step → outCnt<2 in -dir → VMR-=0 → rev=0 → REJECTED
+    //
+    // Weights: 0.15 * intensity + 0.45 * vmrNorm + 0.40 * periodicity >= 0.55
+    //
+    // Re-calibrated for actual log values (VMR 12-20, periodicity 1.0):
+    //   Cortical bone uniform (VMR=2,  rev=0): 0.15*0.43 + 0.45*0.13 + 0.40*0 = 0.12 → NO
+    //   Trabeculae           (VMR=8,  rev=1): 0.15*0.43 + 0.45*0.53 + 0.40*0.5 = 0.50 → NO
+    //   Porous scaffold      (VMR=15, rev=2): 0.15*0.43 + 0.45*1.00 + 0.40*1.0 = 0.91 → YES
+    //   Scaffold (min case)  (VMR=12, rev=1): 0.15*0.43 + 0.45*0.80 + 0.40*0.5 = 0.62 → YES
+    // =========================================================================
+    const float stepMM        = 0.5f;   // mm per step: 0.5mm ≈ 1.7 voxels (X/Y) / 1.0 voxel (Z)
+    const int   numSteps      = 8;      // samples at 0.5..4.0mm — covers full pore-wall-pore cycle
+    // *** Calibrated from log data: scaffold VMR observed at 12-20, NOT 40-60 as assumed.
+    // VMR_NORMALIZE=60 caused vmrNorm≈0.2 for all scaffold → only 258/38M classified.
+    // Set to 15 so that observed scaffold VMR saturates the feature: VMR=15 → vmrNorm=1.0.
+    const float VMR_NORMALIZE   = 15.0f;
+    const float VMR_MAX_GATE    = 50.0f;   // Real scaffold VMR = 12-20; artifact edges produce 100-250.
+                                            // Anything above 50 is a scanner saturation artefact.
+    const float INTENSITY_MAX   = 240.0f;  // Near-saturated voxels (253/255) are metal/scanner artefacts,
+                                            // not scaffold material.  Real scaffold sits at 120-160.
+    const float SCORE_THRESHOLD = 0.50f;   // Slightly relaxed (was 0.55) to catch borderline scaffold.
+
+    // Compute VMR along a single direction; fills outSamples[0..outCnt-1].
+    auto computeVMR = [&](const QVector3D& origin, const QVector3D& dir,
+                          float step, int steps,
+                          float* outSamples, int& outCnt) -> float {
+        outCnt = 0;
+        float sum = 0.0f;
+        for (int s = 1; s <= steps; ++s) {
+            const float dist = s * step;
+            const int sx = static_cast<int>(qRound((origin.x() + dir.x() * dist) / safeSpacingX));
+            const int sy = static_cast<int>(qRound((origin.y() + dir.y() * dist) / safeSpacingY));
+            const int sz = static_cast<int>(qRound((origin.z() + dir.z() * dist) / safeSpacingZ));
+            const float v = sampleF(sx, sy, sz);
+            if (v >= 0.0f) { outSamples[outCnt++] = v; sum += v; }
+        }
+        if (outCnt < 2) return 0.0f;
+        const float mean = sum / outCnt;
+        float var = 0.0f;
+        for (int i = 0; i < outCnt; ++i) { const float d = outSamples[i] - mean; var += d * d; }
+        var /= outCnt;
+        return var / (mean + 1.0f);  // VMR: σ²/(μ+1)
+    };
+
+    // Count direction reversals in an array — periodicity measure.
+    // Hysteresis ±3.0: suppresses voxel-quantization jitter while detecting pore
+    // transitions (scaffold wall↔pore spans 20-80 intensity units in this CT).
+    auto countReversals = [](const float* arr, int cnt) -> int {
+        int rev = 0;
+        for (int i = 1; i < cnt - 1; ++i) {
+            const bool up0 = arr[i]   > arr[i-1] + 3.0f;
+            const bool dn0 = arr[i]   < arr[i-1] - 3.0f;
+            const bool up1 = arr[i+1] > arr[i]   + 3.0f;
+            const bool dn1 = arr[i+1] < arr[i]   - 3.0f;
+            if ((up0 && dn1) || (dn0 && up1)) ++rev;
+        }
+        return rev;
+    };
+
+    int ceramicCount       = 0;
+    int borderSkipped      = 0;
+    int deepCeramicPrinted = 0;
+    const int deepZMin     = volDepth / 10;
+
+    qDebug().noquote() << "-----[ Material Classification Start ]-----";
+    qDebug() << "  Algorithm: max(VMR+, VMR-) + Periodicity via ±normal sampling";
+    qDebug() << "  Volume (W x H x D):" << volWidth << "x" << volHeight << "x" << volDepth;
+    qDebug() << "  Thresholds (0-255): ceramic=" << ceramicThresholdLocal
+             << "  bone=" << boneThresholdLocal;
+    qDebug() << "  Spacing X:" << safeSpacingX << " Y:" << safeSpacingY << " Z:" << safeSpacingZ;
+    qDebug() << "  Vertices:" << inputMesh.vertices.size();
+    qDebug() << "  stepMM:" << stepMM << "  numSteps:" << numSteps
+             << "  VMR_NORMALIZE:" << VMR_NORMALIZE
+             << "  SCORE_THRESHOLD:" << SCORE_THRESHOLD;
+    qDebug() << "  Calibrated from log: scaffold VMR=12-20, VMR_NORMALIZE=15 so vmrNorm saturates at VMR=15";
+    qDebug() << "  Hard rules: (1) centerVal >= ceramicThreshold*0.80   (2) periodicityScore > 0";
+
+    // Per-ray scratch buffer for computeVMR (numSteps=8, +1 margin)
+    float rayBuf[9];
+    int   rayCnt = 0;
+    const int nVerts = inputMesh.vertices.size();
+
+    for (int vi = 0; vi < nVerts; ++vi) {
+        const QVector3D& vertex = inputMesh.vertices[vi];
+
+        int vx = static_cast<int>(qRound(vertex.x() / safeSpacingX));
+        int vy = static_cast<int>(qRound(vertex.y() / safeSpacingY));
+        int vz = static_cast<int>(qRound(vertex.z() / safeSpacingZ));
+        vx = qBound(0, vx, volWidth  - 1);
+        vy = qBound(0, vy, volHeight - 1);
+        vz = qBound(0, vz, volDepth  - 1);
+
+        MaterialType material = MaterialType::Background;
+        QColor color = ceramicColor;
+        color.setAlphaF(0.0f);
+
+        const bool nearBorder = (vx < borderGuard || vx >= volWidth  - borderGuard ||
+                                 vy < borderGuard || vy >= volHeight - borderGuard ||
+                                 vz < borderGuard || vz >= volDepth  - borderGuard);
+        if (nearBorder) {
+            ++borderSkipped;
+        } else {
+            const float centerVal  = sampleF(vx, vy, vz);
+            const QVector3D& nrm   = vertexNormals[vi];
+            const bool validNormal = (nrm.lengthSquared() > 1e-6f);
+
+            // ---------------------------------------------------------------
+            // Omni-directional VMR sampling: ±normal + ±X + ±Y + ±Z = up to 8 dirs.
+            //
+            // WHY: scaffold surface normals typically point radially outward from the
+            // ring, perpendicular to the pore axis. Sampling only along ±normal means
+            // most scaffold vertices cross bone→air (not wall→pore→wall), producing
+            // VMR with 0 reversals and getting rejected. Adding axis-aligned directions
+            // guarantees at least one direction crosses the pore-wall periodicity,
+            // regardless of how the MC normal is oriented.
+            // ---------------------------------------------------------------
+            QVector3D dirs[8];
+            int ndirs = 0;
+            if (validNormal) { dirs[ndirs++] =  nrm; dirs[ndirs++] = -nrm; }
+            dirs[ndirs++] = QVector3D( 1, 0, 0);
+            dirs[ndirs++] = QVector3D(-1, 0, 0);
+            dirs[ndirs++] = QVector3D( 0, 1, 0);
+            dirs[ndirs++] = QVector3D( 0,-1, 0);
+            dirs[ndirs++] = QVector3D( 0, 0, 1);
+            dirs[ndirs++] = QVector3D( 0, 0,-1);
+
+            float bestVMR          = 0.0f;
+            float periodicityScore = 0.0f;
+
+            for (int d = 0; d < ndirs; ++d) {
+                const float vmrD = computeVMR(vertex, dirs[d], stepMM, numSteps, rayBuf, rayCnt);
+                if (vmrD > bestVMR) {
+                    bestVMR = vmrD;
+                    const int rev = countReversals(rayBuf, rayCnt);
+                    periodicityScore = qMin(float(rev) / 2.0f, 1.0f);
+                }
+            }
+
+            // --- Artefact rejection gates ---
+            // Gate A: near-saturated intensity = scanner/metal artefact, never real scaffold.
+            // Gate B: pathologically high VMR = sharp tissue/air edge, not porous scaffold.
+            //   Real scaffold wall-pore-wall: VMR 12-20.  Artefact edges: 100-250.
+            const bool isArtifact = (centerVal > INTENSITY_MAX) || (bestVMR > VMR_MAX_GATE);
+
+            if (!isArtifact) {
+                const float vmrNorm       = qMin(bestVMR / VMR_NORMALIZE, 1.0f);
+                const float intensityNorm = (centerVal >= 0.0f) ? centerVal / 255.0f : 0.0f;
+
+                // Gate 1: intensity must be at least 80% of ceramic threshold.
+                const float intensityGate = ceramicThresholdLocal * 0.80f;
+                const bool passIntensity  = (centerVal >= intensityGate);
+
+                // Gate 2: at least 1 reversal required to distinguish porous scaffold
+                // from a single tissue/air boundary (which has 0 reversals).
+                const bool passReversals  = (periodicityScore > 0.0f);
+
+                const float score = 0.15f * intensityNorm
+                                  + 0.45f * vmrNorm
+                                  + 0.40f * periodicityScore;
+
+                const bool isCeramic = passIntensity && passReversals && (score >= SCORE_THRESHOLD);
+
+                if (isCeramic) {
+                    material = MaterialType::Ceramic;
+                    const float softBlend = qBound(0.20f, 0.15f + 0.60f * score, 0.75f);
+                    color.setAlphaF(softBlend);
+                    ++ceramicCount;
+
+                    if (ceramicCount <= 10) {
+                        qDebug() << "  [Ceramic hit" << ceramicCount << "]"
+                                 << " voxel(" << vx << "," << vy << "," << vz << ")"
+                                 << " intensity:" << qRound(centerVal)
+                                 << " bestVMR:" << QString::number(bestVMR, 'f', 1)
+                                 << " periodicity:" << QString::number(periodicityScore, 'f', 2)
+                                 << " score:" << QString::number(score, 'f', 3);
+                    }
+                    if (deepCeramicPrinted < 5 && vz > deepZMin) {
+                        ++deepCeramicPrinted;
+                        qDebug() << "  [Deep ceramic hit" << deepCeramicPrinted << "]"
+                                 << " voxel(" << vx << "," << vy << "," << vz << ")"
+                                 << " bestVMR:" << QString::number(bestVMR, 'f', 1)
+                                 << " periodicity:" << QString::number(periodicityScore, 'f', 2)
+                                 << " score:" << QString::number(score, 'f', 3);
+                    }
+                }
+            }
+        }
+
+        outputMesh.vertexMaterials.append(material);
+        outputMesh.vertexColors.append(color);
+
+        if ((vi + 1) % eventStride == 0) {
+            qDebug() << "  [classify] progress:" << (vi + 1) << "/" << nVerts
+                     << "  ceramic so far:" << ceramicCount;
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        }
+    }
+
+    // =========================================================================
+    // Post-classification: mesh-topology dilation (region growing on the mesh graph)
+    //
+    // =========================================================================
+    // STEP 3: Volumetric 3D dilation — fill the entire scaffold region.
+    //
+    // Mesh-topology BFS only grows one edge per round; with sparse seeds it
+    // converges long before covering the full scaffold surface.  Instead:
+    //   3a) Project seed vertices into a 3-D voxel bitmap (seedVoxMap).
+    //   3b) Apply a separable prefix-sum box max-filter (radius DILATE_R voxels)
+    //       in X, Y, Z — O(W*H*D) total, no inner loops over radius.
+    //   3c) Promote every non-ceramic mesh vertex whose voxel falls inside the
+    //       dilated region to Ceramic.
+    // This bridges all intra-scaffold gaps regardless of mesh topology and
+    // covers every triangle on the scaffold surface uniformly.
+    // =========================================================================
+    const int mapVol = volWidth * volHeight * volDepth;
+    const int seedsBefore = ceramicCount;
+
+    // --- 3a: mark seed voxels ---
+    std::vector<uint8_t> seedVoxMap(mapVol, 0);
+    for (int vi2 = 0; vi2 < nVerts; ++vi2) {
+        if (outputMesh.vertexMaterials[vi2] != MaterialType::Ceramic) continue;
+        const QVector3D& sv = inputMesh.vertices[vi2];
+        const int sx = qBound(0, qRound(sv.x() / safeSpacingX), volWidth  - 1);
+        const int sy = qBound(0, qRound(sv.y() / safeSpacingY), volHeight - 1);
+        const int sz = qBound(0, qRound(sv.z() / safeSpacingZ), volDepth  - 1);
+        seedVoxMap[sz * volHeight * volWidth + sy * volWidth + sx] = 1;
+    }
+    qDebug() << "  [vol-dilation] Seed voxels marked. Starting 3-D dilation...";
+
+    // --- 3b: separable prefix-sum dilation ---
+    // DILATE_R voxels ≈ DILATE_R * spacing mm.  14 * 0.5 mm = 7 mm — enough to bridge
+    // pore-to-pore gaps inside the scaffold without reaching distant cortical bone.
+    const int DILATE_R = 22;   // ~6.6 mm at 0.3 mm spacing; 11 mm at 0.5 mm spacing.
+    const int maxDim   = std::max({volWidth, volHeight, volDepth});
+    std::vector<uint8_t> dilWorkMap(mapVol, 0);  // intermediate
+    std::vector<uint8_t> dilVoxMap (mapVol, 0);  // final dilated bitmap
+    std::vector<int>     prefixSum (maxDim + 1, 0);
+
+    // Pass 1 — dilate along X: seedVoxMap → dilWorkMap
+    for (int z = 0; z < volDepth; ++z) {
+        for (int y = 0; y < volHeight; ++y) {
+            const int base = z * volHeight * volWidth + y * volWidth;
+            prefixSum[0] = 0;
+            for (int x = 0; x < volWidth; ++x)
+                prefixSum[x + 1] = prefixSum[x] + (seedVoxMap[base + x] ? 1 : 0);
+            for (int x = 0; x < volWidth; ++x) {
+                const int lo = std::max(0, x - DILATE_R);
+                const int hi = std::min(volWidth, x + DILATE_R + 1);
+                if (prefixSum[hi] - prefixSum[lo] > 0)
+                    dilWorkMap[base + x] = 1;
+            }
+        }
+        if (z % 60 == 0)
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    }
+
+    // Pass 2 — dilate along Y: dilWorkMap → dilVoxMap
+    for (int z = 0; z < volDepth; ++z) {
+        for (int x = 0; x < volWidth; ++x) {
+            prefixSum[0] = 0;
+            for (int y = 0; y < volHeight; ++y)
+                prefixSum[y + 1] = prefixSum[y]
+                    + (dilWorkMap[z * volHeight * volWidth + y * volWidth + x] ? 1 : 0);
+            for (int y = 0; y < volHeight; ++y) {
+                const int lo = std::max(0, y - DILATE_R);
+                const int hi = std::min(volHeight, y + DILATE_R + 1);
+                if (prefixSum[hi] - prefixSum[lo] > 0)
+                    dilVoxMap[z * volHeight * volWidth + y * volWidth + x] = 1;
+            }
+        }
+        if (z % 60 == 0)
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    }
+
+    // Pass 3 — dilate along Z: dilVoxMap → dilWorkMap (reuse buffer)
+    std::fill(dilWorkMap.begin(), dilWorkMap.end(), 0);
+    for (int y = 0; y < volHeight; ++y) {
+        for (int x = 0; x < volWidth; ++x) {
+            prefixSum[0] = 0;
+            for (int z = 0; z < volDepth; ++z)
+                prefixSum[z + 1] = prefixSum[z]
+                    + (dilVoxMap[z * volHeight * volWidth + y * volWidth + x] ? 1 : 0);
+            for (int z = 0; z < volDepth; ++z) {
+                const int lo = std::max(0, z - DILATE_R);
+                const int hi = std::min(volDepth, z + DILATE_R + 1);
+                if (prefixSum[hi] - prefixSum[lo] > 0)
+                    dilWorkMap[z * volHeight * volWidth + y * volWidth + x] = 1;
+            }
+        }
+        if (y % 100 == 0)
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    }
+    // dilWorkMap now holds the fully-dilated 3-D ceramic region bitmap.
+    qDebug() << "  [vol-dilation] 3-D dilation complete (radius=" << DILATE_R << "voxels).";
+
+    // --- 3c: promote non-ceramic vertices inside the dilated region ---
+    int volPromoted = 0;
+    for (int vi2 = 0; vi2 < nVerts; ++vi2) {
+        if (outputMesh.vertexMaterials[vi2] == MaterialType::Ceramic) continue;
+        const QVector3D& pv = inputMesh.vertices[vi2];
+        const int px = qBound(0, qRound(pv.x() / safeSpacingX), volWidth  - 1);
+        const int py = qBound(0, qRound(pv.y() / safeSpacingY), volHeight - 1);
+        const int pz = qBound(0, qRound(pv.z() / safeSpacingZ), volDepth  - 1);
+        if (!dilWorkMap[pz * volHeight * volWidth + py * volWidth + px]) continue;
+        // Skip pure air (sampleF normalises 16-bit → 0-255; value < 5 is background).
+        const float pval = sampleF(px, py, pz);
+        if (pval < 5.0f) continue;
+        outputMesh.vertexMaterials[vi2] = MaterialType::Ceramic;
+        outputMesh.vertexColors[vi2].setAlphaF(0.55f);  // solid, opaque blue
+        ++volPromoted;
+        ++ceramicCount;
+        if (vi2 % 4000000 == 0)
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    }
+    qDebug() << "  [vol-dilation] Promoted" << volPromoted << "vertices via volumetric dilation.";
+
+    qDebug().noquote() << "-----[ Ceramic Bone Found ]-----";
+    qDebug() << "  Ceramic seeds (VMR pass):   " << seedsBefore << "/" << nVerts;
+    qDebug() << "  Ceramic after vol-dilation: " << ceramicCount << "/" << nVerts;
+    qDebug() << "  Skipped (near border):      " << borderSkipped;
+    if (nVerts > 0) {
+        qDebug() << QString("  Ceramic coverage: %1%")
+                        .arg(100.0 * ceramicCount / double(nVerts), 0, 'f', 2);
+    }
+    qDebug().noquote() << "-----[ Material Classification End ]-----";
+
+    return outputMesh;
+}

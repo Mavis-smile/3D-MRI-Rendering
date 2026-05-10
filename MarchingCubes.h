@@ -4,12 +4,26 @@
 #include <QVector>
 #include <QVector3D>
 #include <QOpenGLFunctions>
+#include <QColor>
+
+// Material type enumeration for ceramic vs. bone segmentation
+enum class MaterialType : quint8 {
+    Background = 0,
+    Bone = 1,
+    Ceramic = 2
+};
 
 class MarchingCubes {
 public:
     struct Mesh {
         QVector<QVector3D> vertices;
         QVector<unsigned int> indices;
+        QVector<QColor> vertexColors;              // Per-vertex color for material visualization
+        QVector<MaterialType> vertexMaterials;     // Material classification per vertex
+        
+        Mesh() = default;
+        Mesh(const Mesh& other) = default;
+        Mesh& operator=(const Mesh& other) = default;
     };
     static QVector3D interpolateVertex(float isoLevel, int x, int y, int z, float v1, float v2, int edge);
     static Mesh generateMesh(

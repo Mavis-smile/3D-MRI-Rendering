@@ -2,8 +2,11 @@
 
 in vec3 vViewPos;
 in vec3 vViewNormal;
+in vec4 vColor;  // Per-vertex material color
 
 out vec4 FragColor;
+
+uniform bool materialColorsEnabled;  // Toggle for material visualization
 
 void main() {
     vec3 N = normalize(vViewNormal);
@@ -23,6 +26,14 @@ void main() {
     float lightMix = ambient + 0.82 * diffuseKey + 0.24 * diffuseFill + 0.16 * backFill;
 
     vec3 baseColor = vec3(0.92, 0.91, 0.88);
-    vec3 color = baseColor * lightMix + vec3(specular);
-    FragColor = vec4(color, 1.0);
+    vec3 shadedBase = baseColor * lightMix + vec3(specular);
+
+    if (materialColorsEnabled && vColor.a > 0.01) {
+        float overlayStrength = clamp(vColor.a, 0.0, 1.0);
+        vec3 ceramicTint = vColor.rgb;
+        vec3 overlayColor = mix(shadedBase, ceramicTint, overlayStrength);
+        FragColor = vec4(overlayColor, 1.0);
+    } else {
+        FragColor = vec4(shadedBase, 1.0);
+    }
 }
