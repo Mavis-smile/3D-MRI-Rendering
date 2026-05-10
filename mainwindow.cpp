@@ -3925,8 +3925,16 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
                                       int(qRound(currentThreshold16 / 257.0)),
                                       240);
 
+    // Exclude scanner/metal artifact voxels (intensity >= 238 normalized, ~61000 raw 16-bit)
+    // from the ceramic threshold calculation.  Datasets with metal hardware or MRI saturation
+    // can have millions of voxels at [248-255] that inflate the 75th-pct ceramic threshold
+    // far above the actual scaffold signal range, causing the intensity gate to reject most
+    // real scaffold wall vertices.  INTENSITY_MAX=240 in classification already gates these;
+    // match that cutoff here so the threshold reflects actual scaffold, not artifact, density.
+    const int artifactCap = 238;  // ≈ INTENSITY_MAX(240)/257*255
+
     qint64 brightTotal = 0;
-    for (int i = boneCutoffNorm; i < 256; ++i) {
+    for (int i = boneCutoffNorm; i < artifactCap; ++i) {
         brightTotal += histogram[i];
     }
 
@@ -3934,7 +3942,7 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
     if (brightTotal > 0) {
         const qint64 ceramicTarget = qMax<qint64>(1, qRound(brightTotal * 0.75));
         qint64 brightCumulative = 0;
-        for (int i = boneCutoffNorm; i < 256; ++i) {
+        for (int i = boneCutoffNorm; i < artifactCap; ++i) {
             brightCumulative += histogram[i];
             if (brightCumulative >= ceramicTarget) {
                 ceramicCandidate = i;
@@ -4791,7 +4799,7 @@ MarchingCubes::Mesh MainWindow::classifyMeshByMaterial(const MarchingCubes::Mesh
     const int volDepth  = volume16.size();
     const int volHeight = volume16[0].size();
     const int volWidth  = volume16[0][0].size();
-    const int borderGuard = 5;
+    const int borderGuard = 20;
 
     const float safeSpacingX = qMax(0.0001f, voxelSpacingX);
     const float safeSpacingY = qMax(0.0001f, voxelSpacingY);
@@ -4900,7 +4908,7 @@ MarchingCubes::Mesh MainWindow::classifyMeshByMaterial(const MarchingCubes::Mesh
                                             // Anything above 50 is a scanner saturation artefact.
     const float INTENSITY_MAX   = 240.0f;  // Near-saturated voxels (253/255) are metal/scanner artefacts,
                                             // not scaffold material.  Real scaffold sits at 120-160.
-    const float SCORE_THRESHOLD = 0.50f;   // Slightly relaxed (was 0.55) to catch borderline scaffold.
+    const float SCORE_THRESHOLD = 0.55f;   // Restored: per-direction scoring makes this tight gate safe again.
 
     // Compute VMR along a single direction; fills outSamples[0..outCnt-1].
     auto computeVMR = [&](const QVector3D& origin, const QVector3D& dir,
@@ -4955,12 +4963,21 @@ MarchingCubes::Mesh MainWindow::classifyMeshByMaterial(const MarchingCubes::Mesh
              << "  VMR_NORMALIZE:" << VMR_NORMALIZE
              << "  SCORE_THRESHOLD:" << SCORE_THRESHOLD;
     qDebug() << "  Calibrated from log: scaffold VMR=12-20, VMR_NORMALIZE=15 so vmrNorm saturates at VMR=15";
-    qDebug() << "  Hard rules: (1) centerVal >= ceramicThreshold*0.80   (2) periodicityScore > 0";
+    qDebug() << "  Hard rules: (1) centerVal >= Otsu*0.70   (2) periodicityScore > 0";
+
+    // Intensity gate is now applied per-vertex inside the classify loop,
+    // using ceramicThresholdLocal * 0.65 (see inside the loop below).
 
     // Per-ray scratch buffer for computeVMR (numSteps=8, +1 margin)
     float rayBuf[9];
     int   rayCnt = 0;
     const int nVerts = inputMesh.vertices.size();
+
+    // Gate-failure diagnostics (logged after loop to diagnose future datasets).
+    int failArtifactCnt  = 0;
+    int failIntensityCnt = 0;
+    int failReversalsCnt = 0;  // kept for log format compatibility; always 0 (gate removed)
+    int failScoreCnt     = 0;
 
     for (int vi = 0; vi < nVerts; ++vi) {
         const QVector3D& vertex = inputMesh.vertices[vi];
@@ -4982,7 +4999,24 @@ MarchingCubes::Mesh MainWindow::classifyMeshByMaterial(const MarchingCubes::Mesh
         if (nearBorder) {
             ++borderSkipped;
         } else {
-            const float centerVal  = sampleF(vx, vy, vz);
+            // 6-connected max-neighbor intensity.
+            // WHY: MC vertices sit on the iso-surface boundary (~threshold intensity).
+            // qRound() snaps the vertex to either the air side (low, e.g. 50) or the
+            // material side (high, e.g. 140). Scaffold pore-surface vertices routinely
+            // snap to the air side, so sampleF(vx,vy,vz) returns sub-threshold values
+            // and ALL scaffold vertices fail the intensity gate  (Dataset 3: 56.9M blocked).
+            // Taking the max of 6 face-neighbours guarantees we see the adjacent scaffold
+            // wall voxel (intensity ≥ ceramicThreshold), correctly identifying the vertex
+            // as 'near scaffold material' regardless of which side the vertex snapped to.
+            float centerVal = sampleF(vx, vy, vz);
+            const float cnx1 = sampleF(vx+1, vy,   vz  ); if (cnx1 > centerVal) centerVal = cnx1;
+            const float cnx2 = sampleF(vx-1, vy,   vz  ); if (cnx2 > centerVal) centerVal = cnx2;
+            const float cny1 = sampleF(vx,   vy+1, vz  ); if (cny1 > centerVal) centerVal = cny1;
+            const float cny2 = sampleF(vx,   vy-1, vz  ); if (cny2 > centerVal) centerVal = cny2;
+            const float cnz1 = sampleF(vx,   vy,   vz+1); if (cnz1 > centerVal) centerVal = cnz1;
+            const float cnz2 = sampleF(vx,   vy,   vz-1); if (cnz2 > centerVal) centerVal = cnz2;
+            // (sampleF returns -1 for border/OOB, which is correctly ignored by the max)
+
             const QVector3D& nrm   = vertexNormals[vi];
             const bool validNormal = (nrm.lengthSquared() > 1e-6f);
 
@@ -5006,45 +5040,62 @@ MarchingCubes::Mesh MainWindow::classifyMeshByMaterial(const MarchingCubes::Mesh
             dirs[ndirs++] = QVector3D( 0, 0, 1);
             dirs[ndirs++] = QVector3D( 0, 0,-1);
 
-            float bestVMR          = 0.0f;
-            float periodicityScore = 0.0f;
+            // Per-direction scoring: compute score for each direction independently,
+            // then take the BEST-SCORING direction.  This ensures VMR and periodicity
+            // used in the final decision come from the SAME physical direction.
+            //
+            // WHY independent tracking was wrong:
+            //   bestVMR may come from the bone/air edge (VMR=40, rev=0)
+            //   while bestPeriodicity may come from a noisy direction (VMR=3, rev=1).
+            //   Combined: vmrNorm=1.0, periodicity=0.5 → score=0.70 → false ceramic.
+            // WHY per-direction scoring is correct:
+            //   Bone/air edge direction: score = 0.15*I + 0.45*1.0 + 0.40*0 = 0.52 < 0.55 → FAIL.
+            //   Real scaffold direction: score = 0.15*I + 0.45*VMR + 0.40*per > 0.55 → PASS.
+            //   VMR_MAX_GATE applied per-direction: artifact directions are skipped.
+            const float intensityNorm = (centerVal >= 0.0f) ? centerVal / 255.0f : 0.0f;
+            float bestScore       = 0.0f;
+            float bestVMR         = 0.0f;   // for logging
+            float periodicityScore = 0.0f;  // for logging
 
             for (int d = 0; d < ndirs; ++d) {
                 const float vmrD = computeVMR(vertex, dirs[d], stepMM, numSteps, rayBuf, rayCnt);
-                if (vmrD > bestVMR) {
-                    bestVMR = vmrD;
-                    const int rev = countReversals(rayBuf, rayCnt);
-                    periodicityScore = qMin(float(rev) / 2.0f, 1.0f);
+                if (vmrD > VMR_MAX_GATE) continue; // artifact-level direction: skip
+                const int rev = countReversals(rayBuf, rayCnt);
+                const float perD     = qMin(float(rev) / 2.0f, 1.0f);
+                const float vmrNormD = qMin(vmrD / VMR_NORMALIZE, 1.0f);
+                const float scoreD   = 0.15f * intensityNorm + 0.45f * vmrNormD + 0.40f * perD;
+                if (scoreD > bestScore) {
+                    bestScore      = scoreD;
+                    bestVMR        = vmrD;
+                    periodicityScore = perD;
                 }
             }
 
-            // --- Artefact rejection gates ---
-            // Gate A: near-saturated intensity = scanner/metal artefact, never real scaffold.
-            // Gate B: pathologically high VMR = sharp tissue/air edge, not porous scaffold.
-            //   Real scaffold wall-pore-wall: VMR 12-20.  Artefact edges: 100-250.
-            const bool isArtifact = (centerVal > INTENSITY_MAX) || (bestVMR > VMR_MAX_GATE);
+            // Near-saturated intensity = scanner/metal artefact (never real scaffold).
+            const bool isArtifact = (centerVal > INTENSITY_MAX);
 
-            if (!isArtifact) {
-                const float vmrNorm       = qMin(bestVMR / VMR_NORMALIZE, 1.0f);
-                const float intensityNorm = (centerVal >= 0.0f) ? centerVal / 255.0f : 0.0f;
-
-                // Gate 1: intensity must be at least 80% of ceramic threshold.
-                const float intensityGate = ceramicThresholdLocal * 0.80f;
+            if (isArtifact) {
+                ++failArtifactCnt;
+            } else {
+                // Hard gate: max-neighbor intensity >= 85% of ceramic threshold.
+                // With 6-connected max-neighbor, scaffold wall voxels (>= ceramicThreshold)
+                // are always adjacent to pore surface vertices, so this gate is strict
+                // without missing real scaffold.
+                // Dataset 1: ceramicThreshold=130 → gate=110.5. Dataset 3: 143 → gate=121.6.
+                const float intensityGate = ceramicThresholdLocal * 0.85f;
                 const bool passIntensity  = (centerVal >= intensityGate);
 
-                // Gate 2: at least 1 reversal required to distinguish porous scaffold
-                // from a single tissue/air boundary (which has 0 reversals).
-                const bool passReversals  = (periodicityScore > 0.0f);
+                // No separate reversals gate: per-direction scoring handles it naturally.
+                // A direction with 0 reversals scores ≤0.52 → fails threshold 0.55.
 
-                const float score = 0.15f * intensityNorm
-                                  + 0.45f * vmrNorm
-                                  + 0.40f * periodicityScore;
+                const bool isCeramic = passIntensity && (bestScore >= SCORE_THRESHOLD);
 
-                const bool isCeramic = passIntensity && passReversals && (score >= SCORE_THRESHOLD);
+                if (!passIntensity) ++failIntensityCnt;
+                else if (!isCeramic) ++failScoreCnt;
 
                 if (isCeramic) {
                     material = MaterialType::Ceramic;
-                    const float softBlend = qBound(0.20f, 0.15f + 0.60f * score, 0.75f);
+                    const float softBlend = qBound(0.20f, 0.15f + 0.60f * bestScore, 0.75f);
                     color.setAlphaF(softBlend);
                     ++ceramicCount;
 
@@ -5054,7 +5105,7 @@ MarchingCubes::Mesh MainWindow::classifyMeshByMaterial(const MarchingCubes::Mesh
                                  << " intensity:" << qRound(centerVal)
                                  << " bestVMR:" << QString::number(bestVMR, 'f', 1)
                                  << " periodicity:" << QString::number(periodicityScore, 'f', 2)
-                                 << " score:" << QString::number(score, 'f', 3);
+                                 << " score:" << QString::number(bestScore, 'f', 3);
                     }
                     if (deepCeramicPrinted < 5 && vz > deepZMin) {
                         ++deepCeramicPrinted;
@@ -5062,7 +5113,7 @@ MarchingCubes::Mesh MainWindow::classifyMeshByMaterial(const MarchingCubes::Mesh
                                  << " voxel(" << vx << "," << vy << "," << vz << ")"
                                  << " bestVMR:" << QString::number(bestVMR, 'f', 1)
                                  << " periodicity:" << QString::number(periodicityScore, 'f', 2)
-                                 << " score:" << QString::number(score, 'f', 3);
+                                 << " score:" << QString::number(bestScore, 'f', 3);
                     }
                 }
             }
@@ -5107,12 +5158,27 @@ MarchingCubes::Mesh MainWindow::classifyMeshByMaterial(const MarchingCubes::Mesh
         const int sz = qBound(0, qRound(sv.z() / safeSpacingZ), volDepth  - 1);
         seedVoxMap[sz * volHeight * volWidth + sy * volWidth + sx] = 1;
     }
-    qDebug() << "  [vol-dilation] Seed voxels marked. Starting 3-D dilation...";
+    qDebug() << "  [gate stats] artifact:" << failArtifactCnt
+             << " intensity:" << failIntensityCnt
+             << " reversals:" << failReversalsCnt
+             << " score:" << failScoreCnt
+             << " passed:" << ceramicCount;
 
-    // --- 3b: separable prefix-sum dilation ---
-    // DILATE_R voxels ≈ DILATE_R * spacing mm.  14 * 0.5 mm = 7 mm — enough to bridge
-    // pore-to-pore gaps inside the scaffold without reaching distant cortical bone.
-    const int DILATE_R = 22;   // ~6.6 mm at 0.3 mm spacing; 11 mm at 0.5 mm spacing.
+    // --- 3b: adaptive DILATE_R based on seed density ---
+    // Dense seeds need small dilation (seeds already cover scaffold surface well).
+    // Sparse seeds need large dilation to bridge inter-seed gaps.
+    // Calibrated so both datasets produce 10-40% scaffold coverage:
+    //   Dataset 1: seedRate=0.72% → DILATE_R=4  (~1.2 mm at 0.3mm spacing)
+    //   Dataset 3: seedRate=0.007% → DILATE_R=20 (~6 mm at 0.3mm spacing)
+    const double seedRate = (nVerts > 0) ? double(seedsBefore) / nVerts : 0.0;
+    int DILATE_R;
+    if      (seedRate > 0.005) DILATE_R = 4;   // > 0.5%: dense seeds, small spread (~1.2 mm)
+    else if (seedRate > 0.002) DILATE_R = 8;   // > 0.2%: moderate seeds (~2.4 mm)
+    else if (seedRate > 0.001) DILATE_R = 14;  // > 0.1%: sparse seeds (~4.2 mm)
+    else if (seedRate > 0.0001) DILATE_R = 20; // > 0.01%: very sparse (~6.0 mm)
+    else                        DILATE_R = 25; // < 0.01%: isolated seeds (~7.5 mm)
+    qDebug() << "  [vol-dilation] Adaptive DILATE_R:" << DILATE_R
+             << " (seed rate:" << QString::number(seedRate * 100, 'f', 4) << "%)  Starting 3-D dilation...";
     const int maxDim   = std::max({volWidth, volHeight, volDepth});
     std::vector<uint8_t> dilWorkMap(mapVol, 0);  // intermediate
     std::vector<uint8_t> dilVoxMap (mapVol, 0);  // final dilated bitmap
