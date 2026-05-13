@@ -127,6 +127,8 @@ private:
     QElapsedTimer isoChangeTimer;
     QElapsedTimer importTimer;
     QElapsedTimer meshTimer;
+    QElapsedTimer reconstructTimer;   // measures only the Marching Cubes step
+    qint64        reconstructElapsed = 0; // snapshot taken inside worker thread
     QElapsedTimer stlTimer;
     QElapsedTimer meshLoadTimer;
     QVector<QImage> loadedImages; // Store loaded images

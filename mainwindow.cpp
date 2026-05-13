@@ -4358,6 +4358,7 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
          if (!volume.isEmpty()) {
              // Mesh generation logic: production path is a single full-volume pass first.
              reportProgress(84, "Running Marching Cubes (full-volume GPU)...");
+             reconstructTimer.start();
              pendingMesh = MarchingCubes::generateMesh(
                  volume,
                  targetIso,
@@ -4377,6 +4378,7 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
                      voxelSpacingZ
                  );
              }
+             reconstructElapsed = reconstructTimer.elapsed();
 
              reportProgress(90, "Mesh computation complete...");
          }
@@ -4436,7 +4438,8 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
         glWidget->setMaterialColorsEnabled(true);
 
         qDebug().noquote() << "-------";
-        qDebug().noquote() << QString("Generate 3D: %1 s").arg(double(meshTimer.elapsed()) / 1000.0, 0, 'f', 2);
+        qDebug().noquote() << QString("Reconstruction (MC): %1 s").arg(double(reconstructElapsed) / 1000.0, 0, 'f', 2);
+        qDebug().noquote() << QString("Generate 3D (total): %1 s").arg(double(meshTimer.elapsed()) / 1000.0, 0, 'f', 2);
      } else {
          handleMeshRenderingFinished();
      }
