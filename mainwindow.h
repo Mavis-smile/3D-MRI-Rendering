@@ -167,6 +167,9 @@ private:
     bool materialColorsEnabled = false;
     // UI Controls for material visualization
     QCheckBox* materialColorsCheckBox = nullptr;
+    QWidget* materialLegendWidget = nullptr;
+    QWidget* vizTab = nullptr;
+    QWidget* overlayLegendWidget = nullptr;
 
 
     // Material segmentation methods

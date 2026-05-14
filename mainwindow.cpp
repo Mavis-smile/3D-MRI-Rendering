@@ -2087,10 +2087,50 @@ MainWindow::MainWindow(QWidget *parent)
     setCentralWidget(mainTabs);
 
     // Create visualization tab
-    QWidget* vizTab = new QWidget();
+    vizTab = new QWidget();
     QVBoxLayout* vizLayout = new QVBoxLayout(vizTab);
+    vizLayout->setContentsMargins(0, 0, 0, 0);
+    vizLayout->setSpacing(0);
     vizLayout->addWidget(glWidget);
     mainTabs->addTab(vizTab, "3D Visualization");
+
+    // Overlay legend — floats at top-right inside the 3D view, hidden until material colors on
+    overlayLegendWidget = new QWidget(vizTab);
+    overlayLegendWidget->setAttribute(Qt::WA_TranslucentBackground, false);
+    overlayLegendWidget->setStyleSheet(
+        "background-color: rgba(30, 30, 30, 210);"
+        "border: 1px solid #555;"
+        "border-radius: 6px;"
+    );
+    QVBoxLayout* overlayLayout = new QVBoxLayout(overlayLegendWidget);
+    overlayLayout->setContentsMargins(10, 8, 12, 8);
+    overlayLayout->setSpacing(6);
+    // Row 1: Ceramic Bone
+    QHBoxLayout* row1Layout = new QHBoxLayout();
+    row1Layout->setSpacing(6);
+    QLabel* oSwatch = new QLabel(overlayLegendWidget);
+    oSwatch->setFixedSize(14, 14);
+    oSwatch->setStyleSheet("background-color: rgb(50, 130, 255); border: 1px solid #888; border-radius: 2px;");
+    QLabel* oLabel = new QLabel("Ceramic Bone", overlayLegendWidget);
+    oLabel->setStyleSheet("color: #e0e0e0; font-size: 12px; background: transparent;");
+    row1Layout->addWidget(oSwatch);
+    row1Layout->addWidget(oLabel);
+    overlayLayout->addLayout(row1Layout);
+    // Row 2: Bone (non-colorized)
+    QHBoxLayout* row2Layout = new QHBoxLayout();
+    row2Layout->setSpacing(6);
+    QLabel* boneSwatch = new QLabel(overlayLegendWidget);
+    boneSwatch->setFixedSize(14, 14);
+    boneSwatch->setStyleSheet("background-color: rgb(180, 180, 180); border: 1px solid #888; border-radius: 2px;");
+    QLabel* boneLabel = new QLabel("Bone", overlayLegendWidget);
+    boneLabel->setStyleSheet("color: #e0e0e0; font-size: 12px; background: transparent;");
+    row2Layout->addWidget(boneSwatch);
+    row2Layout->addWidget(boneLabel);
+    overlayLayout->addLayout(row2Layout);
+    overlayLegendWidget->adjustSize();
+    overlayLegendWidget->setVisible(false);
+    overlayLegendWidget->raise();
+    vizTab->installEventFilter(this);
 
     // Create preview tab
     createPreviewTab();
@@ -2250,6 +2290,8 @@ void MainWindow::createToolbar() {
     materialColorsCheckBox->setEnabled(false);
     segmentationLayout->addWidget(materialColorsCheckBox);
 
+    // (Legend is shown inside the 3D view as an overlay; no toolbar legend)
+
     toolBar->addSeparator();
     QWidget* toolbarSpacer = new QWidget(this);
     toolbarSpacer->setFixedWidth(28);
@@ -2396,6 +2438,8 @@ void MainWindow::loadImages(const QStringList& filePaths) {
         materialColorsCheckBox->setEnabled(false);
         materialColorsCheckBox->blockSignals(false);
     }
+    if (materialLegendWidget)
+        materialLegendWidget->setVisible(false);
     materialColorsEnabled = false;
     glWidget->setMaterialColorsEnabled(false);
 
@@ -2758,6 +2802,14 @@ void MainWindow::finalizeImportUi() {
 }
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    // Reposition overlay legend when the 3D view tab is resized
+    if (watched == vizTab && event->type() == QEvent::Resize && overlayLegendWidget) {
+        overlayLegendWidget->adjustSize();
+        const int margin = 10;
+        overlayLegendWidget->move(vizTab->width() - overlayLegendWidget->width() - margin, margin);
+        overlayLegendWidget->raise();
+    }
+
     if (event->type() == QEvent::MouseButtonDblClick) {
         QMouseEvent* mouseEvent = static_cast<QMouseEvent*>(event);
         if (mouseEvent->button() == Qt::LeftButton) {
@@ -4436,6 +4488,16 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
         // Mark generation complete and enable material overlay
         materialColorsEnabled = true;
         glWidget->setMaterialColorsEnabled(true);
+        // Show overlay legend (blockSignals above prevented the toggle signal from firing)
+        if (materialLegendWidget)
+            materialLegendWidget->setVisible(true);
+        if (overlayLegendWidget && vizTab) {
+            overlayLegendWidget->adjustSize();
+            const int margin = 10;
+            overlayLegendWidget->move(vizTab->width() - overlayLegendWidget->width() - margin, margin);
+            overlayLegendWidget->raise();
+            overlayLegendWidget->setVisible(true);
+        }
 
         qDebug().noquote() << "-------";
         qDebug().noquote() << QString("Reconstruction (MC): %1 s").arg(double(reconstructElapsed) / 1000.0, 0, 'f', 2);
@@ -4780,6 +4842,18 @@ void MainWindow::onMaterialColorsToggled(bool enabled) {
     materialColorsEnabled = enabled;
     glWidget->setMaterialColorsEnabled(enabled);
     glWidget->update();
+    if (materialLegendWidget)
+        materialLegendWidget->setVisible(enabled);
+    // Overlay legend inside the 3D view
+    if (overlayLegendWidget && vizTab) {
+        if (enabled) {
+            overlayLegendWidget->adjustSize();
+            const int margin = 10;
+            overlayLegendWidget->move(vizTab->width() - overlayLegendWidget->width() - margin, margin);
+            overlayLegendWidget->raise();
+        }
+        overlayLegendWidget->setVisible(enabled);
+    }
     qDebug() << "Material Colors overlay:" << (enabled ? "ON" : "OFF");
 }
 
