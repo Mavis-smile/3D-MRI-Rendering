@@ -83,7 +83,8 @@ SOURCES += \
     LoginDialog.cpp \
     main.cpp \
     mainwindow.cpp \
-    MeshSimplifier.cpp
+    MeshSimplifier.cpp \
+    UserManager.cpp
 
 HEADERS += \
     GLWidget.h \
@@ -92,7 +93,8 @@ HEADERS += \
     LoginDialog.h \
     mainwindow.h \
     MarchingCubes.h \
-    MeshSimplifier.h
+    MeshSimplifier.h \
+    UserManager.h
 
 FORMS += \
     mainwindow.ui \

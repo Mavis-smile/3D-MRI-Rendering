@@ -58,6 +58,9 @@ public:
 private slots:
     void openDataset();
     void toggleControls(bool visible);
+    void showAddUserDialog();
+    void showEditUserDialog();
+    void showDeleteUserDialog();
     void updateThreshold(double value);
     void updateIsoLevel(int value);
     void exportSTL();
@@ -91,6 +94,7 @@ private:
     QPushButton* threshold16AutoButton = nullptr;
     QLabel* thresholdLabel = nullptr;
     QAction* generate3DAct;
+    QAction* deleteUserAct = nullptr;
     double currentThreshold = 0.43;
     static constexpr int kDefaultThreshold16 = 28180;
     int currentThreshold16 = 28180;

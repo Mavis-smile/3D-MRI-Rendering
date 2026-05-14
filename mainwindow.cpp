@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include "GLWidget.h"
+#include "UserManager.h"
 #include <QFile>
 #include <QSaveFile>
 #include <QThread>
@@ -25,6 +26,7 @@
 #include <QTextStream>
 #include <QRegularExpression>
 #include <QComboBox>
+#include <QLineEdit>
 #include <QCoreApplication>
 #include <algorithm>
 #include <atomic>
@@ -2203,12 +2205,186 @@ void MainWindow::createMenu() {
     toggleControlsAct->setCheckable(true);
     toggleControlsAct->setChecked(true);
 
+    // Account Menu
+    QMenu* accountMenu = menuBar->addMenu("&Account");
+    QAction* addUserAct    = accountMenu->addAction("&Add User...");
+    QAction* editUserAct   = accountMenu->addAction("&Edit User...");
+    accountMenu->addSeparator();
+    deleteUserAct = accountMenu->addAction("&Delete User...");
+    deleteUserAct->setEnabled(UserManager::instance().userCount() > 1);
+
     // Connect signals
-    connect(openAct, &QAction::triggered, this, &MainWindow::openDataset);
-    connect(toggleControlsAct, &QAction::toggled, this, &MainWindow::toggleControls);
-    connect(exitAct, &QAction::triggered, qApp, &QApplication::quit);
+    connect(openAct,           &QAction::triggered, this, &MainWindow::openDataset);
+    connect(toggleControlsAct, &QAction::toggled,   this, &MainWindow::toggleControls);
+    connect(exitAct,           &QAction::triggered, qApp, &QApplication::quit);
+    connect(addUserAct,        &QAction::triggered, this, &MainWindow::showAddUserDialog);
+    connect(editUserAct,       &QAction::triggered, this, &MainWindow::showEditUserDialog);
+    connect(deleteUserAct,     &QAction::triggered, this, &MainWindow::showDeleteUserDialog);
 
     setMenuBar(menuBar);
+}
+
+// ── Account management slots ─────────────────────────────────────────────────
+
+void MainWindow::showAddUserDialog()
+{
+    QDialog dlg(this);
+    dlg.setWindowTitle("Add User");
+    dlg.setMinimumWidth(320);
+
+    QFormLayout* form = new QFormLayout(&dlg);
+
+    QLineEdit* userEdit = new QLineEdit(&dlg);
+    QLineEdit* passEdit = new QLineEdit(&dlg);
+    QLineEdit* confirmEdit = new QLineEdit(&dlg);
+    passEdit->setEchoMode(QLineEdit::Password);
+    confirmEdit->setEchoMode(QLineEdit::Password);
+
+    form->addRow("Username:", userEdit);
+    form->addRow("Password:", passEdit);
+    form->addRow("Confirm Password:", confirmEdit);
+
+    QDialogButtonBox* buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    form->addRow(buttons);
+
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    QString username = userEdit->text().trimmed();
+    QString password = passEdit->text();
+    QString confirm  = confirmEdit->text();
+
+    if (username.isEmpty() || password.isEmpty()) {
+        QMessageBox::warning(this, "Add User", "Username and password cannot be empty.");
+        return;
+    }
+    if (password != confirm) {
+        QMessageBox::warning(this, "Add User", "Passwords do not match.");
+        return;
+    }
+    if (!UserManager::instance().addUser(username, password)) {
+        QMessageBox::warning(this, "Add User",
+            QString("Username \"%1\" already exists.").arg(username));
+        return;
+    }
+
+    deleteUserAct->setEnabled(UserManager::instance().userCount() > 1);
+    QMessageBox::information(this, "Add User",
+        QString("User \"%1\" added successfully.").arg(username));
+}
+
+void MainWindow::showEditUserDialog()
+{
+    QStringList users = UserManager::instance().usernames();
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("Edit User");
+    dlg.setMinimumWidth(320);
+
+    QFormLayout* form = new QFormLayout(&dlg);
+
+    QComboBox* userCombo = new QComboBox(&dlg);
+    userCombo->addItems(users);
+
+    QLineEdit* newUserEdit = new QLineEdit(&dlg);
+    QLineEdit* passEdit    = new QLineEdit(&dlg);
+    QLineEdit* confirmEdit = new QLineEdit(&dlg);
+    passEdit->setEchoMode(QLineEdit::Password);
+    confirmEdit->setEchoMode(QLineEdit::Password);
+
+    form->addRow("Select User:", userCombo);
+    form->addRow("New Username:", newUserEdit);
+    form->addRow("New Password:", passEdit);
+    form->addRow("Confirm Password:", confirmEdit);
+
+    // Pre-fill username when selection changes
+    auto prefill = [&]() {
+        newUserEdit->setText(userCombo->currentText());
+    };
+    prefill();
+    connect(userCombo, &QComboBox::currentTextChanged,
+            [&](const QString&) { newUserEdit->setText(userCombo->currentText()); });
+
+    QDialogButtonBox* buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    form->addRow(buttons);
+
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    QString oldUsername = userCombo->currentText();
+    QString newUsername = newUserEdit->text().trimmed();
+    QString password    = passEdit->text();
+    QString confirm     = confirmEdit->text();
+
+    if (newUsername.isEmpty() || password.isEmpty()) {
+        QMessageBox::warning(this, "Edit User", "Username and password cannot be empty.");
+        return;
+    }
+    if (password != confirm) {
+        QMessageBox::warning(this, "Edit User", "Passwords do not match.");
+        return;
+    }
+    if (!UserManager::instance().updateUser(oldUsername, newUsername, password)) {
+        QMessageBox::warning(this, "Edit User",
+            QString("Username \"%1\" already exists.").arg(newUsername));
+        return;
+    }
+
+    QMessageBox::information(this, "Edit User",
+        QString("User \"%1\" updated successfully.").arg(newUsername));
+}
+
+void MainWindow::showDeleteUserDialog()
+{
+    if (UserManager::instance().userCount() <= 1) {
+        QMessageBox::information(this, "Delete User",
+            "Cannot delete the only remaining user account.");
+        return;
+    }
+
+    QStringList users = UserManager::instance().usernames();
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("Delete User");
+    dlg.setMinimumWidth(300);
+
+    QFormLayout* form = new QFormLayout(&dlg);
+
+    QComboBox* userCombo = new QComboBox(&dlg);
+    userCombo->addItems(users);
+    form->addRow("Select User to Delete:", userCombo);
+
+    QDialogButtonBox* buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    form->addRow(buttons);
+
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    QString target = userCombo->currentText();
+    int ret = QMessageBox::question(this, "Delete User",
+        QString("Are you sure you want to delete user \"%1\"?").arg(target),
+        QMessageBox::Yes | QMessageBox::No);
+
+    if (ret != QMessageBox::Yes) return;
+
+    if (!UserManager::instance().deleteUser(target)) {
+        QMessageBox::warning(this, "Delete User",
+            "Failed to delete user. At least one account must remain.");
+        return;
+    }
+
+    deleteUserAct->setEnabled(UserManager::instance().userCount() > 1);
+    QMessageBox::information(this, "Delete User",
+        QString("User \"%1\" deleted.").arg(target));
 }
 
 void MainWindow::createToolbar() {

@@ -1,5 +1,6 @@
 #include "LoginDialog.h"
 #include "ui_LoginDialog.h"
+#include "UserManager.h"
 #include <QCloseEvent>
 #include <QMessageBox>
 #include <QApplication>
@@ -24,8 +25,8 @@ void LoginDialog::closeEvent(QCloseEvent *event)
 
 void LoginDialog::attemptLogin()
 {
-    m_authenticated = (ui->usernameEdit->text() == "admin" &&
-                       ui->passwordEdit->text() == "admin123");
+    m_authenticated = UserManager::instance().authenticate(
+        ui->usernameEdit->text(), ui->passwordEdit->text());
 
     if (m_authenticated) {
         accept(); // Close dialog with Accepted result
