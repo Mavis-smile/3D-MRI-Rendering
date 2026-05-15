@@ -648,102 +648,6 @@ bool numericFileLess(const QFileInfo& a, const QFileInfo& b) {
     return QString::localeAwareCompare(a.fileName(), b.fileName()) < 0;
 }
 
-bool looksLikeReconstructedSliceName(const QString& baseName) {
-    const QString lower = baseName.toLower();
-    return lower.contains("rec") || lower.contains("slice") || lower.contains("section");
-}
-
-bool looksLikeProjectionSeries(const QFileInfoList& files, const QDir& selectedDir, bool hasRecCandidate) {
-    if (files.size() < 120) {
-        return false;
-    }
-
-    int numericCount = 0;
-    int reconstructedNameCount = 0;
-    int tifCount = 0;
-
-    for (const QFileInfo& fi : files) {
-        if (fi.suffix().compare("tif", Qt::CaseInsensitive) == 0 || fi.suffix().compare("tiff", Qt::CaseInsensitive) == 0) {
-            ++tifCount;
-        }
-
-        bool hasTrailingNumber = false;
-        extractLastNumber(fi.completeBaseName(), &hasTrailingNumber);
-        if (hasTrailingNumber) {
-            ++numericCount;
-        }
-
-        if (looksLikeReconstructedSliceName(fi.completeBaseName())) {
-            ++reconstructedNameCount;
-        }
-
-    }
-
-    const bool mostlyNumeric = (numericCount >= int(files.size() * 0.80));
-    const bool mostlyTiff = (tifCount >= int(files.size() * 0.80));
-    const bool lacksRecTokens = (reconstructedNameCount <= int(files.size() * 0.10));
-    const bool denseAcquisitionLike = (files.size() >= 300);
-    const QString dirName = QFileInfo(selectedDir.absolutePath()).fileName();
-    const bool dataLikeFolder = dirName.contains("data", Qt::CaseInsensitive)
-        || dirName.contains("proj", Qt::CaseInsensitive)
-        || dirName.contains("raw", Qt::CaseInsensitive);
-
-    return mostlyNumeric && mostlyTiff && lacksRecTokens && denseAcquisitionLike && (dataLikeFolder || hasRecCandidate);
-}
-
-QString findLikelyReconstructionDir(const QDir& selectedDir) {
-    const QStringList imageFilters = {"*.bmp", "*.png", "*.tif", "*.tiff", "*.jpg", "*.jpeg", "*.dcm", "*.dicom"};
-
-    auto pickBestRecDir = [&](const QDir& baseDir) -> QString {
-        const QFileInfoList childDirs = baseDir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
-        QString bestPath;
-        int bestScore = -1;
-
-        for (const QFileInfo& child : childDirs) {
-            const QString name = child.fileName();
-            const bool recLikeName = name.contains("_rec", Qt::CaseInsensitive)
-                || name.contains("recon", Qt::CaseInsensitive)
-                || name.contains("reconstruction", Qt::CaseInsensitive);
-            if (!recLikeName) {
-                continue;
-            }
-
-            QDir candidate(child.absoluteFilePath());
-            const QFileInfoList imgs = candidate.entryInfoList(imageFilters, QDir::Files, QDir::NoSort);
-            if (imgs.isEmpty()) {
-                continue;
-            }
-
-            int recTokenCount = 0;
-            for (const QFileInfo& fi : imgs) {
-                if (looksLikeReconstructedSliceName(fi.completeBaseName())) {
-                    ++recTokenCount;
-                }
-            }
-
-            const int score = imgs.size() + (recTokenCount * 3);
-            if (score > bestScore) {
-                bestScore = score;
-                bestPath = candidate.absolutePath();
-            }
-        }
-
-        return bestPath;
-    };
-
-    const QString localCandidate = pickBestRecDir(selectedDir);
-    if (!localCandidate.isEmpty()) {
-        return localCandidate;
-    }
-
-    QDir parentDir = selectedDir;
-    if (parentDir.cdUp()) {
-        return pickBestRecDir(parentDir);
-    }
-
-    return QString();
-}
-
 void centerDialogOnWidget(QDialog* dialog, QWidget* parentWidget) {
     if (!dialog) {
         return;
@@ -2492,6 +2396,14 @@ void MainWindow::openDataset() {
         statusBar()->showMessage("STL export is still running. Please wait.", 3000);
         return;
     }
+    if (isGeneratingMesh) {
+        statusBar()->showMessage("Mesh generation is still running. Please wait.", 3000);
+        return;
+    }
+    if (isOtsuRunning) {
+        statusBar()->showMessage("Threshold computation is still running. Please wait.", 3000);
+        return;
+    }
 
     QFileDialog dialog(this);
     dialog.setWindowTitle("Load MRI Dataset");
@@ -2511,40 +2423,6 @@ void MainWindow::openDataset() {
         QStringList filters = {"*.bmp", "*.dcm", "*.dicom", "*.png", "*.jpg", "*.tif", "*.tiff"};
 
         QFileInfoList files = dir.entryInfoList(filters, QDir::Files, QDir::NoSort);
-
-        // Projection folders (raw acquisition frames) can look numerically valid but
-        // do not represent tomographic Z slices. Auto-switch to a reconstruction folder when found.
-        const QString recCandidate = findLikelyReconstructionDir(dir);
-        const bool hasRecCandidate = !recCandidate.isEmpty();
-        if (looksLikeProjectionSeries(files, dir, hasRecCandidate)) {
-            QString message = "The selected folder looks like projection/raw acquisition data, not reconstructed slices.";
-            if (hasRecCandidate) {
-                message += "\n\nSwitch to the detected reconstruction folder?\n" + recCandidate;
-            } else {
-                message += "\n\nPlease select a reconstruction folder (often *_rec / recon / reconstruction).";
-            }
-
-            if (!hasRecCandidate) {
-                QMessageBox::warning(this, "Projection Folder Detected", message);
-                return;
-            }
-
-            const QMessageBox::StandardButton choice = QMessageBox::question(
-                this,
-                "Projection Folder Detected",
-                message,
-                QMessageBox::Yes | QMessageBox::No,
-                QMessageBox::Yes
-            );
-
-            if (choice == QMessageBox::Yes) {
-                dir = QDir(recCandidate);
-                folderPath = recCandidate;
-                files = dir.entryInfoList(filters, QDir::Files, QDir::NoSort);
-                qDebug() << "Auto-switched dataset folder to reconstruction path:" << recCandidate
-                         << "| image count:" << files.size();
-            }
-        }
 
         int trailingNumericCount = 0;
         for (const QFileInfo& fileInfo : files) {
@@ -2622,7 +2500,6 @@ void MainWindow::loadImages(const QStringList& filePaths) {
     if (mainTabs && mainTabs->count() > 1) {
         mainTabs->setTabEnabled(1, false);
     }
-    setEnabled(false);
 
     QVector<int> sliceIndices(filePaths.size());
     std::iota(sliceIndices.begin(), sliceIndices.end(), 0);
@@ -2973,8 +2850,6 @@ void MainWindow::finalizeImportUi() {
             mainTabs->setCurrentIndex(1);
         }
     }
-
-    setEnabled(true);
 }
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
