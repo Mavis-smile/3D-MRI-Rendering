@@ -4205,63 +4205,6 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
     qDebug().noquote() << "-----[ Threshold Estimation End ]-----";
 }
 
- void MainWindow::updateIsoLevel(int value) {
-     qDebug() << "Entering updateIsoLevel";
-
-     if (isoChangeTimer.elapsed() < 100) {
-         qDebug() << "ISO change too fast, skipping";
-         return; // 100ms cooldown
-     }
-     isoChangeTimer.restart();
-
-     float isoLevel = value / 1000.0f;
-     qDebug() << "Generating mesh with ISO:" << isoLevel;
-
-     if (currentVolume.isEmpty()) {
-         qWarning() << "No volume data!";
-         return;
-     }
-
-    qDebug() << "Generating mesh...";
-    currentMesh = MarchingCubes::generateMesh(
-        currentVolume,
-        isoLevel,
-        voxelSpacingX,
-        voxelSpacingY,
-        voxelSpacingZ
-    );
-    if (currentMesh.vertices.isEmpty()) {
-        qDebug() << "Full-volume meshing returned empty result. Falling back to streaming.";
-        currentMesh = MarchingCubes::generateMeshStreaming(
-            currentVolume,
-            isoLevel,
-            8,
-            voxelSpacingX,
-            voxelSpacingY,
-            voxelSpacingZ
-        );
-    }
-     qDebug() << "Generated mesh:"
-              << currentMesh.vertices.size() << "vertices,"
-              << currentMesh.indices.size() / 3 << "triangles";
-
-     qDebug() << "Updating GLWidget...";
-     if (mainTabs && mainTabs->count() > 0) {
-         mainTabs->setCurrentIndex(0);
-     }
-     
-     // Apply material classification if enabled and available
-     if (!currentSegmentationVolume16.isEmpty() && materialColorsEnabled) {
-         MarchingCubes::Mesh classifiedMesh = classifyMeshByMaterial(currentMesh, currentSegmentationVolume16);
-         glWidget->updateMeshWithMaterials(classifiedMesh.vertices, classifiedMesh.indices, classifiedMesh.vertexColors);
-     } else {
-         glWidget->updateMesh(currentMesh.vertices, currentMesh.indices);
-     }
-     
-     glWidget->update();
-
-     qDebug() << "Exiting updateIsoLevel";
- }
 
 
  // Convert QImage to cv::Mat

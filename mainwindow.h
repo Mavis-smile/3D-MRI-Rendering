@@ -62,7 +62,6 @@ private slots:
     void showEditUserDialog();
     void showDeleteUserDialog();
     void updateThreshold(double value);
-    void updateIsoLevel(int value);
     void exportSTL();
     void onThreshold16Changed(int value);
     void onThreshold16Auto();
@@ -126,9 +125,6 @@ private:
     VolumeData currentVolume;
     VolumeData16 currentSegmentationVolume16;
     MarchingCubes::Mesh currentMesh;
-    QSlider *isoSlider; // Add this line
-    QSlider *threshSlider; // Add this line
-    QElapsedTimer isoChangeTimer;
     QElapsedTimer importTimer;
     QElapsedTimer meshTimer;
     QElapsedTimer reconstructTimer;   // measures only the Marching Cubes step
