@@ -654,6 +654,25 @@ MarchingCubes::Mesh MarchingCubes::generateMesh(
 
     // (a) Allocate device memory for volume
     volumeBytes = static_cast<size_t>(volumeSize) * sizeof(float);
+
+    // Pre-flight: verify there is enough free VRAM for the volume + reserve + a minimal vertex
+    // buffer BEFORE allocating, so we bail early without consuming all GPU memory and emitting
+    // a misleading "Insufficient free GPU memory" warning.
+    {
+        size_t preAllocFree = 0;
+        size_t preAllocTotal = 0;
+        const size_t minVertexBytes = 16ULL * 1024ULL * 1024ULL; // 16 MB minimum vertex buffer
+        if (checkCuda(cudaMemGetInfo(&preAllocFree, &preAllocTotal), "cudaMemGetInfo(pre-alloc)")) {
+            if (preAllocFree < volumeBytes + reserveBytes + minVertexBytes + sizeof(int)) {
+                qWarning() << "Insufficient GPU memory for full-volume pass."
+                           << "Volume needs" << (volumeBytes / (1024.0 * 1024.0)) << "MB,"
+                           << "free:" << (preAllocFree / (1024.0 * 1024.0)) << "MB."
+                           << "Use streaming (generateMeshStreaming) instead.";
+                goto cleanup;
+            }
+        }
+    }
+
     if (!checkCuda(cudaMalloc(reinterpret_cast<void**>(&d_volume), volumeBytes), "cudaMalloc(d_volume)")) {
         goto cleanup;
     }
@@ -664,18 +683,20 @@ MarchingCubes::Mesh MarchingCubes::generateMesh(
     }
 
     // (c) Compute a safe output buffer cap from available VRAM and theoretical max.
+    // Note: d_volume is already allocated at this point, so freeMem already reflects that
+    // deduction. Do NOT subtract volumeBytes again here.
     if (!checkCuda(cudaMemGetInfo(&freeMem, &totalMem), "cudaMemGetInfo")) {
         goto cleanup;
     }
 
     theoreticalMaxVertices =
         static_cast<size_t>(width - 1) * static_cast<size_t>(height - 1) * static_cast<size_t>(depth - 1) * 15ULL;
-    if (freeMem <= reserveBytes + volumeBytes + sizeof(int)) {
-        qWarning() << "Insufficient free GPU memory. Free:" << (freeMem / (1024.0 * 1024.0)) << "MB";
+    if (freeMem <= reserveBytes + sizeof(int)) {
+        qWarning() << "Insufficient free GPU memory after volume allocation. Free:" << (freeMem / (1024.0 * 1024.0)) << "MB";
         goto cleanup;
     }
 
-    usableVertexBytes = freeMem - reserveBytes - volumeBytes - sizeof(int);
+    usableVertexBytes = freeMem - reserveBytes - sizeof(int);
     maxVerticesByMemory = usableVertexBytes / sizeof(float3);
     maxVerticesSizeT = qMin(theoreticalMaxVertices, maxVerticesByMemory);
     maxVerticesSizeT = qMin(maxVerticesSizeT, static_cast<size_t>(std::numeric_limits<int>::max()));
