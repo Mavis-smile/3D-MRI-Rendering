@@ -2405,44 +2405,74 @@ void MainWindow::openDataset() {
         return;
     }
 
-    QFileDialog dialog(this);
-    dialog.setWindowTitle("Load MRI Dataset");
-    dialog.setFileMode(QFileDialog::Directory); // Allow selecting a directory
-    dialog.setOption(QFileDialog::ShowDirsOnly, true); // Only show directories
+    // Ask the user whether to select a folder or specific files.
+    QDialog modeDialog(this);
+    modeDialog.setWindowTitle("Load MRI Dataset");
+    modeDialog.setMinimumWidth(340);
 
-    if (dialog.exec() == QDialog::Accepted) {
+    QVBoxLayout* vlay = new QVBoxLayout(&modeDialog);
+    vlay->setContentsMargins(20, 16, 20, 16);
+    vlay->setSpacing(12);
+
+    QLabel* promptLabel = new QLabel("How would you like to load data?", &modeDialog);
+    promptLabel->setAlignment(Qt::AlignCenter);
+    vlay->addWidget(promptLabel);
+
+    QHBoxLayout* btnRow = new QHBoxLayout();
+    btnRow->setSpacing(10);
+    QPushButton* folderBtn = new QPushButton("Select Folder", &modeDialog);
+    QPushButton* filesBtn  = new QPushButton("Select Files",  &modeDialog);
+    QPushButton* cancelBtn = new QPushButton("Cancel",        &modeDialog);
+    folderBtn->setMinimumWidth(110);
+    filesBtn ->setMinimumWidth(110);
+    cancelBtn->setMinimumWidth(80);
+    btnRow->addWidget(folderBtn);
+    btnRow->addWidget(filesBtn);
+    btnRow->addStretch();
+    btnRow->addWidget(cancelBtn);
+    vlay->addLayout(btnRow);
+
+    int choice = 0; // 0=cancel, 1=folder, 2=files
+    QObject::connect(folderBtn, &QPushButton::clicked, [&](){ choice = 1; modeDialog.accept(); });
+    QObject::connect(filesBtn,  &QPushButton::clicked, [&](){ choice = 2; modeDialog.accept(); });
+    QObject::connect(cancelBtn, &QPushButton::clicked, &modeDialog, &QDialog::reject);
+    modeDialog.exec();
+
+    if (choice == 1) {
+        // --- Folder mode (original behaviour) ---
+        QFileDialog dialog(this);
+        dialog.setWindowTitle("Load MRI Dataset — Select Folder");
+        dialog.setFileMode(QFileDialog::Directory);
+        dialog.setOption(QFileDialog::ShowDirsOnly, true);
+
+        if (dialog.exec() != QDialog::Accepted) return;
         const QStringList selected = dialog.selectedFiles();
         if (selected.isEmpty()) {
             QMessageBox::warning(this, "No Folder Selected", "No dataset folder was selected.");
             return;
         }
-        QString folderPath = selected.first(); // Get the selected folder path
+        QString folderPath = selected.first();
         QDir dir(folderPath);
 
         // Filter for image files and enforce numeric ordering by slice number in filenames.
         QStringList filters = {"*.bmp", "*.dcm", "*.dicom", "*.png", "*.jpg", "*.tif", "*.tiff"};
-
         QFileInfoList files = dir.entryInfoList(filters, QDir::Files, QDir::NoSort);
 
         int trailingNumericCount = 0;
         for (const QFileInfo& fileInfo : files) {
             bool hasTrailingNumber = false;
             extractLastNumber(fileInfo.completeBaseName(), &hasTrailingNumber);
-            if (hasTrailingNumber) {
-                ++trailingNumericCount;
-            }
+            if (hasTrailingNumber) ++trailingNumericCount;
         }
 
-        // If most files are numbered slices, drop non-numbered helpers (for example *_arc.tif).
+        // If most files are numbered slices, drop non-numbered helpers (e.g. *_arc.tif).
         if (!files.isEmpty() && trailingNumericCount >= qMax(16, int(files.size() * 0.70))) {
             QFileInfoList numericOnly;
             numericOnly.reserve(trailingNumericCount);
             for (const QFileInfo& fileInfo : files) {
                 bool hasTrailingNumber = false;
                 extractLastNumber(fileInfo.completeBaseName(), &hasTrailingNumber);
-                if (hasTrailingNumber) {
-                    numericOnly.append(fileInfo);
-                }
+                if (hasTrailingNumber) numericOnly.append(fileInfo);
             }
             if (!numericOnly.isEmpty()) {
                 qDebug() << "Filtered non-slice files:" << (files.size() - numericOnly.size())
@@ -2455,20 +2485,37 @@ void MainWindow::openDataset() {
 
         QStringList filePaths;
         filePaths.reserve(files.size());
-        for (const QFileInfo& fileInfo : files) {
-            filePaths.append(fileInfo.absoluteFilePath());
-        }
+        for (const QFileInfo& fileInfo : files) filePaths.append(fileInfo.absoluteFilePath());
 
-        if (!files.isEmpty()) {
+        if (!files.isEmpty())
             qDebug() << "Slice ordering sample:" << files.first().fileName() << "..." << files.last().fileName();
-        }
 
         if (!filePaths.isEmpty()) {
-            loadImages(filePaths); // Load all images in the folder
+            loadImages(filePaths);
         } else {
             QMessageBox::warning(this, "No Images Found", "The selected folder does not contain any valid images.");
         }
+
+    } else if (choice == 2) {
+        // --- Individual files mode ---
+        const QString filter = "Image Files (*.bmp *.dcm *.dicom *.png *.jpg *.tif *.tiff);;All Files (*)";
+        QStringList filePaths = QFileDialog::getOpenFileNames(
+            this, "Load MRI Dataset — Select Images", QString(), filter);
+
+        if (filePaths.isEmpty()) return;
+
+        // Sort selected files using the same numeric ordering as the folder path.
+        QFileInfoList files;
+        files.reserve(filePaths.size());
+        for (const QString& p : filePaths) files.append(QFileInfo(p));
+        std::sort(files.begin(), files.end(), numericFileLess);
+
+        filePaths.clear();
+        for (const QFileInfo& fi : files) filePaths.append(fi.absoluteFilePath());
+
+        loadImages(filePaths);
     }
+    // else: Cancel — do nothing
 }
 
 void MainWindow::loadImages(const QStringList& filePaths) {
