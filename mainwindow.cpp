@@ -2500,7 +2500,7 @@ void MainWindow::openDataset() {
         // --- Individual files mode ---
         const QString filter = "Image Files (*.bmp *.dcm *.dicom *.png *.jpg *.tif *.tiff);;All Files (*)";
         QStringList filePaths = QFileDialog::getOpenFileNames(
-            this, "Load MRI Dataset — Select Images", QString(), filter);
+            this, "Load Dataset — Select Images", QString(), filter);
 
         if (filePaths.isEmpty()) return;
 
@@ -5276,11 +5276,19 @@ MarchingCubes::Mesh MainWindow::classifyMeshByMaterial(const MarchingCubes::Mesh
         const int sz = qBound(0, qRound(sv.z() / safeSpacingZ), volDepth  - 1);
         seedVoxMap[sz * volHeight * volWidth + sy * volWidth + sx] = 1;
     }
-    qDebug() << "  [gate stats] artifact:" << failArtifactCnt
-             << " intensity:" << failIntensityCnt
-             << " reversals:" << failReversalsCnt
-             << " score:" << failScoreCnt
-             << " passed:" << ceramicCount;
+    // Print all rejection stages so the counts sum exactly to nVerts:
+    //   nVerts = artifact + intensity(low) + border(skipped) + reversals + score(failed) + passed
+    const int gateTotal = failArtifactCnt + failIntensityCnt + borderSkipped
+                        + failReversalsCnt + failScoreCnt + ceramicCount;
+    qDebug() << "  [gate stats]"
+             << "| total:"      << nVerts
+             << "| 1-artifact:" << failArtifactCnt
+             << "| 2-intensity(rejected):" << failIntensityCnt
+             << "| 3-border(skipped):"     << borderSkipped
+             << "| 4-reversals:"           << failReversalsCnt
+             << "| 5-score(failed):"       << failScoreCnt
+             << "| 6-passed:"              << ceramicCount
+             << "| check:" << gateTotal << (gateTotal == nVerts ? "(OK)" : "(MISMATCH!)");
 
     // --- 3b: adaptive DILATE_R based on seed density ---
     // Dense seeds need small dilation (seeds already cover scaffold surface well).

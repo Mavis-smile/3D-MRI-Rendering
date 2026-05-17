@@ -664,8 +664,9 @@ MarchingCubes::Mesh MarchingCubes::generateMesh(
         const size_t minVertexBytes = 16ULL * 1024ULL * 1024ULL; // 16 MB minimum vertex buffer
         if (checkCuda(cudaMemGetInfo(&preAllocFree, &preAllocTotal), "cudaMemGetInfo(pre-alloc)")) {
             if (preAllocFree < volumeBytes + reserveBytes + minVertexBytes + sizeof(int)) {
+                const double totalNeededMB = (volumeBytes + reserveBytes + minVertexBytes + sizeof(int)) / (1024.0 * 1024.0);
                 qWarning() << "Insufficient GPU memory for full-volume pass."
-                           << "Volume needs" << (volumeBytes / (1024.0 * 1024.0)) << "MB,"
+                           << "Total needed (volume + vertex buffer + reserve):" << totalNeededMB << "MB,"
                            << "free:" << (preAllocFree / (1024.0 * 1024.0)) << "MB."
                            << "Use streaming (generateMeshStreaming) instead.";
                 goto cleanup;
