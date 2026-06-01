@@ -107,6 +107,8 @@ private:
     bool previewBuildInProgress = false;
     QTimer previewBuildTimer;
     QPointer<QProgressDialog> activeImportDialog;
+    bool importCanceled = false;
+    void abortImport();
     // void createDockPanels();
     void loadImages(const QStringList& filePaths);
     // QImage loadImage(const QString& path);  // Add this line

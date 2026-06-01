@@ -2523,6 +2523,8 @@ void MainWindow::loadImages(const QStringList& filePaths) {
     currentImagePaths = filePaths;
     syncThresholdControls();
 
+    importCanceled = false;
+
     loadedImages.clear();
     originalImages.clear();
     segmentationSlices16.clear();
@@ -2580,10 +2582,28 @@ void MainWindow::loadImages(const QStringList& filePaths) {
             this, [progressDialog, totalSlices](int value) {
                 progressDialog->setLabelText(QString("Loading image %1/%2").arg(value).arg(totalSlices));
             });
-    connect(progressDialog, &QProgressDialog::canceled, watcher, &QFutureWatcher<LoadedSliceResult>::cancel);
+
+    // Use a QPointer so the cancel lambda is safe even if the watcher is deleted
+    // before the cancel fires (e.g. user cancels during the preview-build stage).
+    QPointer<QFutureWatcher<LoadedSliceResult>> weakWatcher(watcher);
+    connect(progressDialog, &QProgressDialog::canceled, this,
+            [this, weakWatcher, loadPool]() {
+        importCanceled = true;
+        if (weakWatcher) {
+            weakWatcher->cancel();
+        }
+        loadPool->clear(); // stop queuing pending decode tasks
+        abortImport();
+    });
 
             connect(watcher, &QFutureWatcher<LoadedSliceResult>::finished, this,
                 [this, watcher, progressDialog, loadPool]() {
+
+        // Cancelled during load stage: abortImport() already called from canceled() slot.
+        if (importCanceled || watcher->isCanceled()) {
+            watcher->deleteLater();
+            return;
+        }
 
         if (progressDialog) {
             progressDialog->setLabelText("Finalizing loaded slices...");
@@ -2597,6 +2617,11 @@ void MainWindow::loadImages(const QStringList& filePaths) {
         auto* finalizeWatcher = new QFutureWatcher<ImportFinalizeResult>(this);
         connect(finalizeWatcher, &QFutureWatcher<ImportFinalizeResult>::finished, this,
             [this, finalizeWatcher, watcher, progressDialog, loadPool]() {
+            // Cancelled during finalize stage: abortImport() already called.
+            if (importCanceled) {
+                finalizeWatcher->deleteLater();
+                return;
+            }
             ImportFinalizeResult result = finalizeWatcher->result();
 
             originalImages = std::move(result.originalImages);
@@ -2841,6 +2866,17 @@ void MainWindow::appendPreviewThumbnails() {
         return;
     }
 
+    // Cancelled during the preview-build stage (after loading finished).
+    // The canceled() slot already called abortImport() which stops this timer,
+    // but guard here too in case of re-entry before the stop takes effect.
+    if (importCanceled) {
+        previewBuildTimer.stop();
+        previewBuildInProgress = false;
+        previewBuildImages.clear();
+        previewBuildIndex = 0;
+        return;
+    }
+
     const int thumbsPerRow = 4;
     const int thumbSize = 200;
     const int batchSize = (previewBuildImages.size() >= 800) ? 28 : 14;
@@ -2886,7 +2922,9 @@ void MainWindow::appendPreviewThumbnails() {
 
 void MainWindow::finalizeImportUi() {
     if (activeImportDialog) {
-        activeImportDialog->close();
+        // Use hide() instead of close(): QProgressDialog::closeEvent() emits
+        // canceled(), which would trigger abortImport() and wipe the loaded data.
+        activeImportDialog->hide();
         activeImportDialog->deleteLater();
         activeImportDialog = nullptr;
     }
@@ -2897,6 +2935,53 @@ void MainWindow::finalizeImportUi() {
             mainTabs->setCurrentIndex(1);
         }
     }
+}
+
+void MainWindow::abortImport() {
+    // Idempotent — safe to call from the canceled() slot, the load-finished
+    // guard, the finalize-finished guard, or the preview-build guard.
+
+    // Hide (not close) the dialog: close() fires QProgressDialog::closeEvent()
+    // which emits canceled() again, causing re-entrant abortImport() calls.
+    if (activeImportDialog) {
+        activeImportDialog->hide();
+        activeImportDialog->deleteLater();
+        activeImportDialog = nullptr;
+    }
+
+    // Stop the thumbnail-build timer and reset its state.
+    previewBuildTimer.stop();
+    previewBuildInProgress = false;
+    previewBuildImages.clear();
+    previewBuildIndex = 0;
+
+    // Remove any thumbnails already added to the preview grid.
+    if (previewLayout) {
+        QLayoutItem* item;
+        while ((item = previewLayout->takeAt(0)) != nullptr) {
+            if (item->widget()) {
+                item->widget()->removeEventFilter(this);
+                delete item->widget();
+            }
+            delete item;
+        }
+    }
+
+    // Drop all imported slice data so no partial dataset is left behind.
+    loadedImages.clear();
+    originalImages.clear();
+    segmentationSlices16.clear();
+    currentSegmentationVolume16.clear();
+    hasSegmentation16Data = false;
+    currentImagePaths.clear();
+
+    // Re-enable the preview tab (it will be empty) so the user can still
+    // click it and immediately re-import without any UI being locked out.
+    if (mainTabs && mainTabs->count() > 1) {
+        mainTabs->setTabEnabled(1, true);
+    }
+
+    statusBar()->showMessage("Import cancelled", 3000);
 }
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
