@@ -2609,6 +2609,12 @@ void MainWindow::loadImages(const QStringList& filePaths) {
         // Cancelled during load stage: abortImport() already called from canceled() slot.
         if (importCanceled || watcher->isCanceled()) {
             watcher->deleteLater();
+            // Release the thread pool so its idle threads are destroyed promptly
+            // instead of accumulating as orphaned children of MainWindow.  Each
+            // leaked pool keeps up to workerThreads (4-12) alive for the 30 s
+            // expiry period, which directly competes with the mesh generation
+            // worker on the OS scheduler.
+            loadPool->deleteLater();
             return;
         }
 
@@ -2627,6 +2633,7 @@ void MainWindow::loadImages(const QStringList& filePaths) {
             // Cancelled during finalize stage: abortImport() already called.
             if (importCanceled) {
                 finalizeWatcher->deleteLater();
+                loadPool->deleteLater(); // release pool threads on cancel path
                 return;
             }
             ImportFinalizeResult result = finalizeWatcher->result();
@@ -2672,6 +2679,10 @@ void MainWindow::loadImages(const QStringList& filePaths) {
                 qDebug().noquote() << "-------";
                 updateImagePreviews();
             }
+            // Explicitly release the thread pool and this watcher so their
+            // threads / QObject children don't accumulate on MainWindow.
+            finalizeWatcher->deleteLater();
+            loadPool->deleteLater();
         });
 
         finalizeWatcher->setFuture(QtConcurrent::run([future]() -> ImportFinalizeResult {
@@ -3400,7 +3411,7 @@ MainWindow::VolumeData MainWindow::convertToVolume(const QVector<QImage>& images
         writeVolumeSlice(z, images[z], nullptr, 0.0f);
 
         if (progressCallback) {
-            const int progress = 5 + ((z + 1) * 70 / depth);
+            const int progress = 2 + ((z + 1) * 73 / depth);
             progressCallback(progress, QString("Building 3D volume... %1/%2 slices").arg(z + 1).arg(depth));
         }
     }
@@ -3427,11 +3438,8 @@ MainWindow::VolumeData MainWindow::convertToVolume(const QVector<QImage>& images
     //     volumeFile.close();
     // }
 
-    // Active production path intentionally disables XY/Z smoothing and inter-slice blending
-    // so the mesh input remains a strict thresholded binary field.
-
     if (progressCallback) {
-        progressCallback(90, "Volume ready. Preparing GPU execution...");
+        progressCallback(75, "Volume ready. Preparing GPU execution...");
     }
 
     qDebug() << "Volume created successfully.";
@@ -3724,7 +3732,7 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
     // ribbon-like tearing in top/front views. Apply permissive Z-bridging before meshing.
     if (denseInput && depth >= 3) {
         if (progressCallback) {
-            progressCallback(16, "Applying dense-stack Z consistency bridging...");
+            progressCallback(20, "Applying dense-stack Z consistency bridging...");
         }
 
         const int zPasses = 2;
@@ -4073,10 +4081,6 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
 
     if (occupancy < 0.1 || occupancy > 99.9) {
         qWarning() << "16-bit volume is nearly uniform with this threshold; mesh may be empty.";
-    }
-
-    if (progressCallback) {
-        progressCallback(90, "16-bit volume ready. Preparing GPU execution...");
     }
 
     qDebug() << "16-bit volume created successfully.";
@@ -4535,8 +4539,10 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
          VolumeData volume;
          if (hasSegmentation16Data && !segmentationSlices16.isEmpty() && segmentationSlices16.size() == loadedImages.size()) {
              qDebug() << "Using native 16-bit segmentation path for mesh generation.";
+             reportProgress(3, "Building raw volume...");
              currentSegmentationVolume16 = buildRawVolume16(segmentationSlices16);
              if (isCancelled()) return;
+             reportProgress(6, "Starting adaptive segmentation...");
              volume = convertToVolume16(segmentationSlices16, currentThreshold16, 1.0f, reportProgress);
          } else {
              // Fallback path for non-16-bit stacks.
