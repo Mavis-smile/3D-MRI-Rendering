@@ -2052,13 +2052,20 @@ MainWindow::MainWindow(QWidget *parent)
     loadingDialog->setWindowModality(Qt::WindowModal);
     loadingDialog->setWindowTitle("Mesh Generation Progress");
     loadingDialog->setLabelText("Preparing mesh generation...");
-    loadingDialog->setCancelButton(nullptr);
+    loadingDialog->setCancelButtonText("Cancel");
     loadingDialog->setRange(0, 100);
     loadingDialog->setValue(0);
     loadingDialog->setMinimumDuration(0);
     loadingDialog->setAutoClose(false);
     loadingDialog->setAutoReset(false);
     loadingDialog->reset();
+
+    meshGenerationCancelled = std::make_shared<std::atomic_bool>(false);
+    // Wire Cancel button (and dialog close/Escape) to the cancel handler.
+    // Using hide() in finalizeMeshProgressDialog() ensures this signal only fires
+    // on genuine user cancellation, not on programmatic dialog dismissal.
+    connect(loadingDialog, &QProgressDialog::canceled,
+            this, &MainWindow::handleMeshGenerationCanceled);
 
     connect(&meshGenerationWatcher, &QFutureWatcher<void>::started,
             this, &MainWindow::handleMeshGenerationStarted);
@@ -4494,7 +4501,14 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
      currentThreshold16 = threshold16SpinBox ? threshold16SpinBox->value() : currentThreshold16;
      currentThreshold = qBound(0.0, double(currentThreshold16) / 65535.0, 1.0);
 
-     QFuture<void> future = QtConcurrent::run([this]() {
+     // Reset cancellation state for this run.
+     if (!meshGenerationCancelled) {
+         meshGenerationCancelled = std::make_shared<std::atomic_bool>(false);
+     }
+     meshGenerationCancelled->store(false, std::memory_order_relaxed);
+     auto cancelFlag = meshGenerationCancelled;
+
+     QFuture<void> future = QtConcurrent::run([this, cancelFlag]() {
          const int sliceCount = loadedImages.size();
          const float targetIso = 0.50f;
          const QString profile = (sliceCount <= 48) ? "sparse" : ((sliceCount >= 200) ? "dense" : "balanced");
@@ -4504,18 +4518,25 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
                   << "iso:" << targetIso
                   << "spacing:" << voxelSpacingX << voxelSpacingY << voxelSpacingZ;
 
-         auto reportProgress = [this](int progress, const QString& message) {
+         auto isCancelled = [&cancelFlag]() {
+             return cancelFlag->load(std::memory_order_relaxed);
+         };
+
+         auto reportProgress = [this, &cancelFlag](int progress, const QString& message) {
+             if (cancelFlag->load(std::memory_order_relaxed)) return;
              QMetaObject::invokeMethod(this, [this, progress, message]() {
                  updateLoadingDialog(progress, message);
              }, Qt::QueuedConnection);
          };
 
+         if (isCancelled()) return;
          reportProgress(1, "Preparing volume data...");
 
          VolumeData volume;
          if (hasSegmentation16Data && !segmentationSlices16.isEmpty() && segmentationSlices16.size() == loadedImages.size()) {
              qDebug() << "Using native 16-bit segmentation path for mesh generation.";
              currentSegmentationVolume16 = buildRawVolume16(segmentationSlices16);
+             if (isCancelled()) return;
              volume = convertToVolume16(segmentationSlices16, currentThreshold16, 1.0f, reportProgress);
          } else {
              // Fallback path for non-16-bit stacks.
@@ -4533,6 +4554,12 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
              volume = convertToVolume(*meshSource, reportProgress);
          }
 
+         // Check before the expensive Marching Cubes passes.
+         if (isCancelled()) {
+             pendingMesh = MarchingCubes::Mesh();
+             return;
+         }
+
          if (!volume.isEmpty()) {
              // Mesh generation logic: production path is a single full-volume pass first.
              reportProgress(84, "Running Marching Cubes (full-volume GPU)...");
@@ -4545,6 +4572,11 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
                  voxelSpacingZ
              );
 
+             if (isCancelled()) {
+                 pendingMesh = MarchingCubes::Mesh();
+                 return;
+             }
+
              if (pendingMesh.vertices.isEmpty()) {
                  reportProgress(88, "Falling back to streaming GPU meshing...");
                  pendingMesh = MarchingCubes::generateMeshStreaming(
@@ -4555,6 +4587,11 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
                      voxelSpacingY,
                      voxelSpacingZ
                  );
+
+                 if (isCancelled()) {
+                     pendingMesh = MarchingCubes::Mesh();
+                     return;
+                 }
              }
              reconstructElapsed = reconstructTimer.elapsed();
 
@@ -4564,6 +4601,17 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
 
      meshGenerationWatcher.setFuture(future);
  }
+
+ void MainWindow::handleMeshGenerationCanceled() {
+     // Set the flag so the worker exits at the next checkpoint.
+     // The actual UI teardown happens in handleMeshComputationFinished once the
+     // worker thread has returned.
+     if (meshGenerationCancelled) {
+         meshGenerationCancelled->store(true, std::memory_order_relaxed);
+     }
+     statusBar()->showMessage("Cancelling mesh generation...", 2000);
+ }
+
 
  void MainWindow::handleMeshGenerationStarted() {
      if (!isGeneratingMesh) {
@@ -4576,6 +4624,16 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
  }
 
  void MainWindow::handleMeshComputationFinished() {
+     // If the user cancelled, do not classify/upload a partial mesh — just clean up.
+     if (meshGenerationCancelled && meshGenerationCancelled->load(std::memory_order_relaxed)) {
+         isGeneratingMesh = false;
+         waitingForMeshUploadCompletion = false;
+         pendingMesh = MarchingCubes::Mesh();
+         finalizeMeshProgressDialog();
+         statusBar()->showMessage("Mesh generation cancelled", 3000);
+         return;
+     }
+
      if (!pendingMesh.vertices.isEmpty()) {
         // Save threshold as good threshold for warm-start on next dataset
         imageProcessor.saveLastGoodThreshold(currentThreshold16);
@@ -4660,6 +4718,11 @@ void MainWindow::updateLoadingDialog(int progress, const QString& message) {
     if (!loadingDialog || !isGeneratingMesh) {
         return;
     }
+    // Do not call setValue while cancelled — with minimumDuration=0 that would
+    // re-show the dialog the user just dismissed.
+    if (meshGenerationCancelled && meshGenerationCancelled->load(std::memory_order_relaxed)) {
+        return;
+    }
 
     loadingDialog->setValue(qBound(0, progress, 100));
     if (!message.isEmpty()) {
@@ -4671,10 +4734,8 @@ void MainWindow::finalizeMeshProgressDialog() {
     if (!loadingDialog) {
         return;
     }
-    // Close and hide ONLY — do NOT call setValue/reset here.
-    // QProgressDialog with minimumDuration=0 re-shows itself whenever setValue is called
-    // after close/hide, so we defer the reset to just before the next show() in generateMesh().
-    loadingDialog->close();
+    // Use hide() instead of close(): QProgressDialog::closeEvent() emits canceled(),
+    // which would re-trigger handleMeshGenerationCanceled on programmatic dismissal.
     loadingDialog->hide();
 }
 

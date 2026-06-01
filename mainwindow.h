@@ -41,6 +41,8 @@
 #include <QSpinBox>
 #include <QtConcurrent/QtConcurrent>
 #include <functional>
+#include <atomic>
+#include <memory>
 
 
 class GLWidget;
@@ -69,6 +71,7 @@ private slots:
     void handleMeshGenerationStarted();
     void handleMeshComputationFinished();
     void handleMeshRenderingFinished();
+    void handleMeshGenerationCanceled();
     void appendPreviewThumbnails();
     void finalizeImportUi();
 
@@ -124,6 +127,8 @@ private:
     static quint16 computeOtsuThreshold16(const VolumeData16& volume);
     void updateLoadingDialog(int progress, const QString& message);
     void generateMesh();
+    // Cancellation flag shared between the UI cancel slot and the background worker.
+    std::shared_ptr<std::atomic_bool> meshGenerationCancelled;
     VolumeData currentVolume;
     VolumeData16 currentSegmentationVolume16;
     MarchingCubes::Mesh currentMesh;
