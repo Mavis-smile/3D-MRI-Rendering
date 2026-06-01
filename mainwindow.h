@@ -100,6 +100,7 @@ private:
     double currentThreshold = 0.43;
     static constexpr int kDefaultThreshold16 = 28180;
     int currentThreshold16 = 28180;
+    int previousThreshold16 = 28180;
     QTabWidget* mainTabs;
     QWidget* previewTab;
     QScrollArea* previewScroll;

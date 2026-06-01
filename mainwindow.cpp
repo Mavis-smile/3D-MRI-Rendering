@@ -4970,25 +4970,46 @@ void MainWindow::onThreshold16Auto() {
         return;
     }
 
+    previousThreshold16 = threshold16SpinBox->value();
+
     isOtsuRunning = true;
     if (generate3DAct) {
         generate3DAct->setEnabled(false);
     }
     threshold16AutoButton->setEnabled(false);
-    
+
     // Use QUICK threshold computation (instant if warm-start available)
     int warmStart = imageProcessor.loadLastGoodThreshold();
     if (warmStart > 0) {
-        // Warm-start available: instant feedback
-        statusBar()->showMessage("Using previous good threshold as warm-start...", 1500);
-        threshold16SpinBox->setValue(warmStart);
-        currentThreshold = qBound(0.0, double(warmStart) / 65535.0, 1.0);
         isOtsuRunning = false;
         if (generate3DAct) {
             generate3DAct->setEnabled(true);
         }
         threshold16AutoButton->setEnabled(true);
-        thresholdLabel->setText(QString("Threshold (16-bit): %1 (warm-start)").arg(warmStart));
+
+        // Show comparison dialog so the user can accept or discard the suggestion.
+        QMessageBox msgBox(this);
+        msgBox.setWindowTitle("Auto Threshold Result");
+        msgBox.setTextFormat(Qt::RichText);
+        msgBox.setText(
+            QString("<table cellspacing=\"6\">"
+                    "<tr><td>Previous threshold:</td><td><b>%1</b></td></tr>"
+                    "<tr><td>Auto threshold (Otsu):</td><td><b>%2</b></td></tr>"
+                    "</table>")
+                .arg(previousThreshold16).arg(warmStart));
+        QPushButton* applyBtn = msgBox.addButton("Apply Otsu", QMessageBox::AcceptRole);
+        msgBox.addButton("Keep Previous", QMessageBox::RejectRole);
+        msgBox.setDefaultButton(applyBtn);
+        msgBox.exec();
+
+        if (msgBox.clickedButton() == applyBtn) {
+            threshold16SpinBox->setValue(warmStart);
+            currentThreshold = qBound(0.0, double(warmStart) / 65535.0, 1.0);
+            thresholdLabel->setText(QString("Threshold (16-bit): %1 (Otsu)").arg(warmStart));
+            statusBar()->showMessage(QString("Otsu threshold applied: %1").arg(warmStart), 3000);
+        } else {
+            statusBar()->showMessage("Kept previous threshold.", 2000);
+        }
         return;
     }
 
@@ -5005,18 +5026,35 @@ void MainWindow::onOtsuComputationFinished() {
     const int suggestedThreshold = otsuWatcher.future().result();
     const int boundedThreshold = qBound(0, suggestedThreshold, 65535);
 
-    threshold16SpinBox->setValue(boundedThreshold);
-    currentThreshold = qBound(0.0, double(boundedThreshold) / 65535.0, 1.0);
     isOtsuRunning = false;
     if (generate3DAct) {
         generate3DAct->setEnabled(true);
     }
     threshold16AutoButton->setEnabled(true);
 
-    statusBar()->showMessage(
-        QString("Threshold suggested: %1. Click Generate 3D to rebuild the old thresholded mesh path.")
-            .arg(boundedThreshold),
-        5000);
+    // Show comparison dialog so the user can accept or discard the suggestion.
+    QMessageBox msgBox(this);
+    msgBox.setWindowTitle("Auto Threshold Result");
+    msgBox.setTextFormat(Qt::RichText);
+    msgBox.setText(
+        QString("<table cellspacing=\"6\">"
+                "<tr><td>Previous threshold:</td><td><b>%1</b></td></tr>"
+                "<tr><td>Auto threshold (Otsu):</td><td><b>%2</b></td></tr>"
+                "</table>")
+            .arg(previousThreshold16).arg(boundedThreshold));
+    QPushButton* applyBtn = msgBox.addButton("Apply Otsu", QMessageBox::AcceptRole);
+    msgBox.addButton("Keep Previous", QMessageBox::RejectRole);
+    msgBox.setDefaultButton(applyBtn);
+    msgBox.exec();
+
+    if (msgBox.clickedButton() == applyBtn) {
+        threshold16SpinBox->setValue(boundedThreshold);
+        currentThreshold = qBound(0.0, double(boundedThreshold) / 65535.0, 1.0);
+        thresholdLabel->setText(QString("Threshold (16-bit): %1 (Otsu)").arg(boundedThreshold));
+        statusBar()->showMessage(QString("Otsu threshold applied: %1").arg(boundedThreshold), 3000);
+    } else {
+        statusBar()->showMessage("Kept previous threshold.", 2000);
+    }
 }
 
 // ============================================================================
