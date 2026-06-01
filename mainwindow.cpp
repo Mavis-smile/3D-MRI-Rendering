@@ -4262,7 +4262,11 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
      }
 
      if (currentMesh.vertices.isEmpty() || currentMesh.indices.isEmpty()) {
-         statusBar()->showMessage("No mesh to export!", 3000);
+         QMessageBox::warning(
+             this,
+             "No Mesh to Export",
+             "There is no 3D mesh available for export.\n\n"
+             "Please generate a 3D mesh first by clicking \"Generate 3D\".");
          return;
      }
 
