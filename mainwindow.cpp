@@ -206,7 +206,7 @@ bool promptExportOptions(QWidget* parent, int triangleCount, qint64 estimatedByt
     auto* layout = new QVBoxLayout(&dialog);
     auto* form = new QFormLayout();
 
-    auto* simplifyCheck = new QCheckBox("Simplify before export (keep 35% triangles)", &dialog);
+    auto* simplifyCheck = new QCheckBox("Simplify before export (target ~50k triangles)", &dialog);
     simplifyCheck->setChecked(estimatedBytes > 200LL * 1024LL * 1024LL);
 
     auto* estimateLabel = new QLabel(&dialog);
@@ -215,7 +215,8 @@ bool promptExportOptions(QWidget* parent, int triangleCount, qint64 estimatedByt
     // Lambda to update the estimate label based on checkbox state
     auto updateEstimate = [simplifyCheck, estimateLabel, triangleCount]() {
         if (simplifyCheck->isChecked()) {
-            const int estimatedTriangles = qMax(1, int(std::lround(double(triangleCount) * 0.35)));
+            static constexpr int kPrintFaceTarget = 50'000;
+            const int estimatedTriangles = qMin(kPrintFaceTarget, qMax(1, int(std::lround(double(triangleCount) * 0.35))));
             const qint64 estimatedSize = 84LL + (static_cast<qint64>(estimatedTriangles) * 50LL);
             estimateLabel->setText(QString("Estimated after simplification:\n~%1 triangles (~%2 MB)")
                                       .arg(estimatedTriangles)
@@ -244,9 +245,10 @@ bool promptExportOptions(QWidget* parent, int triangleCount, qint64 estimatedByt
     }
 
     options->simplifyBeforeExport = simplifyCheck->isChecked();
-    options->preset = ExportPreset::Low;  // Always use Low preset (35% triangles)
-    options->targetFaceCount = qMax(1, int(std::lround(double(triangleCount) * 0.35)));
-    options->aggressiveness = 2.5;  // Conservative aggressiveness; internal anatomy preservation via smart triangle classification handles target achievement
+    options->preset = ExportPreset::Low;
+    static constexpr int kPrintFaceTarget = 50'000;
+    options->targetFaceCount = qMin(kPrintFaceTarget, qMax(1, int(std::lround(double(triangleCount) * 0.35))));
+    options->aggressiveness = 1.0;  // Direct target; pipeline pre-clusters to ~150k then QEM reaches this
     return true;
 }
 
@@ -4904,6 +4906,20 @@ void MainWindow::finalizeMeshProgressDialog() {
              );
              qDebug().noquote() << "-------";
              watcher->deleteLater();
+
+             // Loaded mesh has no MRI-derived material classification — disable the overlay.
+             if (materialColorsCheckBox) {
+                 materialColorsCheckBox->blockSignals(true);
+                 materialColorsCheckBox->setChecked(false);
+                 materialColorsCheckBox->setEnabled(false);
+                 materialColorsCheckBox->blockSignals(false);
+             }
+             materialColorsEnabled = false;
+             glWidget->setMaterialColorsEnabled(false);
+             if (materialLegendWidget)
+                 materialLegendWidget->setVisible(false);
+             if (overlayLegendWidget)
+                 overlayLegendWidget->setVisible(false);
          });
 
          QTimer::singleShot(0, this, [this]() {
