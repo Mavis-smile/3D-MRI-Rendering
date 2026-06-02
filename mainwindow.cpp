@@ -4341,7 +4341,7 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
 
          auto* watcher = new QFutureWatcher<StlExportResult>(this);
          connect(watcher, &QFutureWatcher<StlExportResult>::finished, this,
-                 [this, watcher, finishUi]() {
+                 [this, watcher, finishUi, fileName]() {
              const StlExportResult result = watcher->result();
 
              finishUi();
@@ -4370,6 +4370,14 @@ void MainWindow::estimateMaterialThresholds(const VolumeData16& volume16, int& c
              qDebug() << "[STL Export] Completed with" << result.writtenTriangles << "triangle(s).";
              qDebug().noquote() << "-------";
              watcher->deleteLater();
+
+             QMessageBox::information(this,
+                                      "Export Complete",
+                                      QString("STL file exported successfully.\n\n"
+                                              "File: %1\n"
+                                              "Triangles: %2")
+                                          .arg(QFileInfo(fileName).fileName())
+                                          .arg(result.writtenTriangles));
          });
 
          watcher->setFuture(QtConcurrent::run([fileName,
@@ -5025,7 +5033,6 @@ void MainWindow::onThreshold16Auto() {
         if (msgBox.clickedButton() == applyBtn) {
             threshold16SpinBox->setValue(warmStart);
             currentThreshold = qBound(0.0, double(warmStart) / 65535.0, 1.0);
-            thresholdLabel->setText(QString("Threshold (16-bit): %1 (Otsu)").arg(warmStart));
             statusBar()->showMessage(QString("Otsu threshold applied: %1").arg(warmStart), 3000);
         } else {
             statusBar()->showMessage("Kept previous threshold.", 2000);
@@ -5070,7 +5077,6 @@ void MainWindow::onOtsuComputationFinished() {
     if (msgBox.clickedButton() == applyBtn) {
         threshold16SpinBox->setValue(boundedThreshold);
         currentThreshold = qBound(0.0, double(boundedThreshold) / 65535.0, 1.0);
-        thresholdLabel->setText(QString("Threshold (16-bit): %1 (Otsu)").arg(boundedThreshold));
         statusBar()->showMessage(QString("Otsu threshold applied: %1").arg(boundedThreshold), 3000);
     } else {
         statusBar()->showMessage("Kept previous threshold.", 2000);

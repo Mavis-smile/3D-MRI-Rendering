@@ -886,8 +886,6 @@ QVector<cv::Mat> ImageProcessor::processSlices16Adaptive(
     qDebug() << "FINAL occupancy: " << finalOccupancy << "%";
     qDebug() << "Safety correction applied: " << (finalThreshold != globalThreshold ? "YES" : "NO");
     qDebug() << "Kept components: " << totalKeptComponents;
-    qDebug() << "Sparse slices (low occupancy): " << slicesTooSparse;
-    qDebug() << "Dense slices (high occupancy): " << slicesTooDense;
     qDebug() << "Total slices: " << sliceCount;
     qDebug() << "Total volume voxels: " << totalVoxels;
     qDebug() << "Filled voxels: " << totalFilledVoxels;
