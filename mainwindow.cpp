@@ -4059,6 +4059,92 @@ MainWindow::VolumeData MainWindow::convertToVolume16(const QVector<cv::Mat>& sli
         }
     }
 
+    // Targeted thin-column/row artifact removal: catches narrow scanner-frame or holder
+    // strips near the volume border that appear as lines in the mesh.
+    // Runs unconditionally. Each row/column is checked individually; only those present
+    // in >= 65% of slices are removed, which avoids clipping intermittent anatomy.
+    if (!masksForVolume.isEmpty() && width >= 8 && height >= 8 && depth >= 4) {
+        // Scale edge bands with volume dimensions so fixture strips a few percent
+        // from the border edge are still caught (do NOT use a fixed small constant).
+        const int edgeBandX = qMax(4, width / 25);    // ~58px for W=1456
+        const int edgeBandY = qMax(4, height / 10);   // ~48px for H=489
+
+        // Build per-column/row slice-presence counts with a single O(D*H*W) pass.
+        std::vector<int> colPresence(width, 0);
+        std::vector<int> rowPresence(height, 0);
+        for (int z = 0; z < depth; ++z) {
+            const cv::Mat& mask = masksForVolume[z];
+            if (mask.empty()) continue;
+            std::vector<bool> colHasFg(width, false);
+            std::vector<bool> rowHasFg(height, false);
+            for (int y = 0; y < height; ++y) {
+                const uchar* rowPtr = mask.ptr<uchar>(y);
+                for (int x = 0; x < width; ++x) {
+                    if (rowPtr[x] > 0) {
+                        colHasFg[x] = true;
+                        rowHasFg[y] = true;
+                    }
+                }
+            }
+            for (int x = 0; x < width; ++x)  if (colHasFg[x])  ++colPresence[x];
+            for (int y = 0; y < height; ++y)  if (rowHasFg[y])  ++rowPresence[y];
+        }
+
+        // Log presence ratios for every checked border row/column to aid diagnosis.
+        qDebug() << "--- Border-strip scan: edgeBandX=" << edgeBandX
+                 << " edgeBandY=" << edgeBandY << " depth=" << depth << "---";
+        for (int i = 0; i < edgeBandX; ++i) {
+            qDebug() << " col[" << i << "] presence=" << colPresence[i]
+                     << "/" << depth << "("
+                     << QString::number(100.0 * colPresence[i] / depth, 'f', 1) << "%)";
+            qDebug() << " col[" << (width-1-i) << "] presence=" << colPresence[width-1-i]
+                     << "/" << depth << "("
+                     << QString::number(100.0 * colPresence[width-1-i] / depth, 'f', 1) << "%)";
+        }
+        for (int i = 0; i < edgeBandY; ++i) {
+            qDebug() << " row[" << i << "] presence=" << rowPresence[i]
+                     << "/" << depth << "("
+                     << QString::number(100.0 * rowPresence[i] / depth, 'f', 1) << "%)";
+            qDebug() << " row[" << (height-1-i) << "] presence=" << rowPresence[height-1-i]
+                     << "/" << depth << "("
+                     << QString::number(100.0 * rowPresence[height-1-i] / depth, 'f', 1) << "%)";
+        }
+
+        const double persistenceThreshold = 0.65;
+        int thinStripsRemoved = 0;
+
+        // Left/right edge columns.
+        for (int side = 0; side < 2; ++side) {
+            for (int i = 0; i < edgeBandX; ++i) {
+                const int x = (side == 0) ? i : (width - 1 - i);
+                if (double(colPresence[x]) / double(depth) >= persistenceThreshold) {
+                    for (int z = 0; z < depth; ++z)
+                        masksForVolume[z].col(x).setTo(0);
+                    ++thinStripsRemoved;
+                    qDebug() << "Thin border-column artifact removed at x=" << x
+                             << "(presence" << colPresence[x] << "/" << depth << ")";
+                }
+            }
+        }
+
+        // Top/bottom edge rows.
+        for (int side = 0; side < 2; ++side) {
+            for (int i = 0; i < edgeBandY; ++i) {
+                const int y = (side == 0) ? i : (height - 1 - i);
+                if (double(rowPresence[y]) / double(depth) >= persistenceThreshold) {
+                    for (int z = 0; z < depth; ++z)
+                        masksForVolume[z].row(y).setTo(0);
+                    ++thinStripsRemoved;
+                    qDebug() << "Thin border-row artifact removed at y=" << y
+                             << "(presence" << rowPresence[y] << "/" << depth << ")";
+                }
+            }
+        }
+
+        qDebug() << "Thin persistent edge-strip removal: cleared" << thinStripsRemoved
+                 << "border column/rows from" << depth << "slices.";
+    }
+
     const qint64 totalVoxels = static_cast<qint64>(width) * height * depth;
     qint64 filledVoxels = 0;
 
