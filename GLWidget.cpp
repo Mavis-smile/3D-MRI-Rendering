@@ -154,6 +154,24 @@ void GLWidget::createGeometry() {
     ibo.create();
 }
 
+void GLWidget::clearMesh() {
+    makeCurrent();
+    if (vbo.isCreated()) vbo.destroy();
+    if (ibo.isCreated()) ibo.destroy();
+    if (colorVbo.isCreated()) colorVbo.destroy();
+    if (vao.isCreated()) vao.destroy();
+    indexCount = 0;
+    meshSize = 1.0f;
+    meshCenter = QVector3D(0.0f, 0.0f, 0.0f);
+    hasPerVertexColors = false;
+    currentVertexColors.clear();
+    // Recreate an empty VAO so paintGL has a valid binding.
+    vao.create();
+    doneCurrent();
+    qDebug() << "[GLWidget] clearMesh: viewport cleared.";
+    update(); // schedule immediate repaint -> black viewport
+}
+
 void GLWidget::updateMesh(const QVector<QVector3D>& vertices, const QVector<unsigned int>& indices) {
     qDebug() << "Updating mesh with" << vertices.size() << "vertices and" << indices.size() << "indices";
     const bool hugeMesh = (vertices.size() > 1200000 || indices.size() > 3600000);

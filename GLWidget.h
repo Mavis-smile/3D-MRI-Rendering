@@ -27,6 +27,9 @@ public:
 
     void updateMesh(const QVector<QVector3D>& vertices,
                     const QVector<unsigned int>& indices);
+
+    // Immediately removes any rendered geometry and repaints the viewport black.
+    void clearMesh();
     
     // New: Extended mesh update with per-vertex colors
     void updateMeshWithMaterials(const QVector<QVector3D>& vertices,

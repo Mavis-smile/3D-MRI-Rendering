@@ -2534,6 +2534,10 @@ void MainWindow::loadImages(const QStringList& filePaths) {
 
     importCanceled = false;
 
+    // Snapshot state BEFORE clearing — used below to decide whether to wipe the 3D model.
+    const bool hadDataset = !loadedImages.isEmpty() || !originalImages.isEmpty();
+    const bool hadMesh    = !currentMesh.vertices.isEmpty() || !pendingMesh.vertices.isEmpty();
+
     loadedImages.clear();
     originalImages.clear();
     segmentationSlices16.clear();
@@ -2552,8 +2556,20 @@ void MainWindow::loadImages(const QStringList& filePaths) {
     }
     if (materialLegendWidget)
         materialLegendWidget->setVisible(false);
+    if (overlayLegendWidget)
+        overlayLegendWidget->setVisible(false);
     materialColorsEnabled = false;
     glWidget->setMaterialColorsEnabled(false);
+
+    // Clear the previously generated 3D model only when a dataset was already
+    // loaded AND a mesh exists — so re-importing doesn't wipe a mesh the user
+    // never generated in the first place.
+    if (hadDataset && hadMesh) {
+        currentMesh = MarchingCubes::Mesh();
+        pendingMesh = MarchingCubes::Mesh();
+        glWidget->clearMesh();
+        qDebug() << "[Import] Previous dataset + mesh detected — cleared 3D model for new import.";
+    }
 
     if (mainTabs && mainTabs->count() > 1) {
         mainTabs->setTabEnabled(1, false);

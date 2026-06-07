@@ -1,6 +1,7 @@
 #include "MeshSimplifier.h"
 
 #include <QDebug>
+#include <QElapsedTimer>
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
@@ -865,8 +866,23 @@ SimplifyReport simplifyMeshDetailed(const MarchingCubes::Mesh& inputMesh, int ta
 
     qDebug() << "[Simplifier] decimater initialized; starting decimation.";
 
+    qDebug().noquote() << QString(
+        "=== QEM Decimation START ===\n"
+        "  Input faces   : %1\n"
+        "  Target faces  : %2\n"
+        "  Aggressiveness: %3\n"
+        "  Backend       : %4"
+    ).arg(simplificationInput.indices.size() / 3)
+     .arg(effectiveTarget)
+     .arg(aggressiveness, 0, 'f', 2)
+     .arg(backendName());
+
+    QElapsedTimer qemTimer;
+    qemTimer.start();
     const bool decimationOk = decimater.decimate_to_faces(static_cast<unsigned int>(effectiveTarget));
-    qDebug() << "[Simplifier] decimation finished ok=" << decimationOk;
+    const qint64 qemElapsedMs = qemTimer.elapsed();
+    qDebug() << "[Simplifier] QEM decimation finished ok=" << decimationOk
+             << "elapsed:" << qemElapsedMs << "ms";
     mesh.garbage_collection();
     qDebug() << "[Simplifier] post-GC faces:" << mesh.n_faces()
              << "vertices:" << mesh.n_vertices();
@@ -911,10 +927,23 @@ SimplifyReport simplifyMeshDetailed(const MarchingCubes::Mesh& inputMesh, int ta
         qWarning() << "[Simplifier] output face count matches input face count; decimation may have been unable to collapse any edges.";
     }
 
-    qDebug() << "[Simplifier] input faces:" << report.inputFaceCount
-             << "target faces:" << effectiveTarget
-             << "output faces:" << report.outputFaceCount
-             << "backend:" << backendName();
+    const double reductionPct = (report.inputFaceCount > 0)
+        ? (1.0 - double(report.outputFaceCount) / double(report.inputFaceCount)) * 100.0
+        : 0.0;
+    qDebug().noquote() << QString(
+        "=== QEM Decimation COMPLETE ===\n"
+        "  Input faces : %1\n"
+        "  Target faces: %2\n"
+        "  Output faces: %3\n"
+        "  Reduction   : %4%\n"
+        "  QEM time    : %5 ms\n"
+        "  Success     : %6"
+    ).arg(report.inputFaceCount)
+     .arg(effectiveTarget)
+     .arg(report.outputFaceCount)
+     .arg(reductionPct, 0, 'f', 1)
+     .arg(qemElapsedMs)
+     .arg(report.success ? "YES" : "NO");
     return report;
 #endif
 }
